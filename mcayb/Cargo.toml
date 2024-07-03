@@ -1,0 +1,27 @@
+[package]
+name = "mcayb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ende = { git = "https://github.com/bohdloss/ende", features = ["all", "debug"] }
+serde = { version = "1.0.203", features = ["derive"] }
+parse-display = "0.9.1"
+anyhow = "1.0.86"
+openssl = "0.10.64"
+cryptostream = "0.3.2"
+tokio = { version = "1.38.0", features = ["full"] }
+sha2 = "0.10.8"
+yapper = { path = "../yapper" }
+serenity = { version = "0.12.2" }
+serenity-commands = "0.4.3"
+file-guard = "0.2.0"
+expanduser = "1.2.2"
+serde_json = "1.0.118"
+async-scoped = { version = "0.9.0", features = ["use-tokio"] }
+base64 = "0.22.1"
+rand = "0.8.5"
+once_cell = "1.19.0"
+reqwest = "0.12.5"
+is-url = "1.0.4"
+url = "2.5.2"
