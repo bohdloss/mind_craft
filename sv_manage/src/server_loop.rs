@@ -525,7 +525,7 @@ fn upload_zip(account: &str, server: &str) -> Result<String>
 	let zip_path = zip_path.canonicalize().context("Failed to canonicalize zip file path")?;
 
 	let mut client = Client::builder().danger_accept_invalid_certs(true).build().unwrap();
-	let response = client.post("https://127.0.0.1:7216/assets/mods")
+	let response = client.post(format!("https://{}/assets/mods", include_str!("../ip.token").trim()))
 		.bearer_auth(include_str!("../spam.token"))
 		.multipart(Form::new().file("file", &zip_path).context("Failed to read mods zip file")?)
 		.send()
@@ -536,7 +536,7 @@ fn upload_zip(account: &str, server: &str) -> Result<String>
 		let string = core::str::from_utf8(bytes.as_ref()).context("Failed to read response body as utf-8")?;
 		let uuid = Uuid::from_str(string).context("Response body wasn't a UUID")?;
 
-		Ok(format!("https://{}/assets/mods/{uuid}", include_str!("../ip.token")))
+		Ok(format!("https://{}/assets/mods/{uuid}", include_str!("../ip.token").trim()))
 	} else {
 		bail!("Failed to post mods.zip: {}", response.status())
 	}
