@@ -25,7 +25,7 @@ use yapper::conf::Config;
 use anyhow::Result;
 use axum::handler::HandlerWithoutStateExt;
 use axum_server::tls_openssl::OpenSSLConfig;
-use yapper::{DelOnDrop, DelOnDropOwned};
+use yapper::{DelOnDrop, DelOnDropOwned, dispatch_display};
 use crate::config::{Access, CONFIG, Scope, SPAM, Token};
 
 #[tokio::main]
@@ -57,7 +57,7 @@ async fn main() {
 		.fallback(get(wtf_unknown_page))
 		.with_state(config);
 
-	axum_server::bind_openssl(SocketAddr::from(SocketAddrV4::from_str(include_str!("../ip.token")).unwrap()), OpenSSLConfig::from_pem(include_bytes!("../cert.pem"), include_bytes!("../key.pem")).unwrap())
+	axum_server::bind_openssl(include_str!("../ip.token").parse().inspect_err(|err| dispatch_display(err)).unwrap(), OpenSSLConfig::from_pem(include_bytes!("../cert.pem"), include_bytes!("../key.pem")).unwrap())
 		.serve(base_router.into_make_service())
 		.await
 		.expect("Serve failed");
