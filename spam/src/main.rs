@@ -57,7 +57,7 @@ async fn main() {
 		.fallback(get(wtf_unknown_page))
 		.with_state(config);
 
-	axum_server::bind_openssl(include_str!("../ip.token").parse().inspect_err(|err| dispatch_display(err)).unwrap(), OpenSSLConfig::from_pem(include_bytes!("../cert.pem"), include_bytes!("../key.pem")).unwrap())
+	axum_server::bind_openssl(include_str!("../ip.token").trim().parse().inspect_err(|err| dispatch_display(err)).unwrap(), OpenSSLConfig::from_pem(include_bytes!("../cert.pem"), include_bytes!("../key.pem")).unwrap())
 		.serve(base_router.into_make_service())
 		.await
 		.expect("Serve failed");
