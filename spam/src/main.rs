@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::http::header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE};
+use axum::http::header::{AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
 use axum::response::{IntoResponse, Response};
 use axum::{Router, serve};
 use axum::routing::{get, MethodFilter, MethodRouter, post};
@@ -75,16 +75,13 @@ async fn serve_file(content: impl AsRef<str>, path: impl AsRef<std::path::Path>)
 		.and_then(|x| x.to_str())
 		.unwrap_or("document");
 
-	file_response(file, content, name, true)
+	file_response(file, content, name, true).await
 }
 
-fn file_response<T: AsyncRead + Send + 'static>(file: T, c_type: impl AsRef<str>, filename: impl AsRef<str>, inline: bool) -> Response {
+async fn file_response(file: File, c_type: impl AsRef<str>, filename: impl AsRef<str>, inline: bool) -> Response {
 	if filename.as_ref().contains("\"") {
 		return StatusCode::INTERNAL_SERVER_ERROR.into_response();
 	}
-	let stream = ReaderStream::new(file);
-	let body = StreamBody::new(stream);
-
 	let mut resp = Response::builder()
 		.header(CONTENT_TYPE, c_type.as_ref());
 
@@ -94,6 +91,13 @@ fn file_response<T: AsyncRead + Send + 'static>(file: T, c_type: impl AsRef<str>
 		resp = resp.header(CONTENT_DISPOSITION, format!(r#"attachment; filename="{}""#, filename.as_ref()));
 	}
 
+	if let Ok(metadata) = file.metadata().await {
+		resp = resp.header(CONTENT_LENGTH, metadata.len().to_string())
+	}
+	
+	let stream = ReaderStream::new(file);
+	let body = StreamBody::new(stream);
+	
 	resp.body(Body::from_stream(body))
 		.unwrap_or(StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
@@ -164,5 +168,5 @@ async fn serve_mods(State(config): State<Config<SPAM>>, Path(unique_id): Path<St
 	};
 	let _ = fs::remove_file(&path); // The file is open, so removing it means we can still read it
 
-	file_response(file, "application/zip", "mods.zip", false)
+	file_response(file, "application/zip", "mods.zip", false).await
 }
