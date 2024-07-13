@@ -6,29 +6,20 @@ pub const CONFIG: &str = "sv_manage.json";
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct SVManage {
+	pub port: u16,
+	pub accounts: HashMap<String, AccountData>
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct AccountData {
 	pub cache: Cache,
-	pub gateway: GatewayConf,
+	pub password: [u8; 32],
 	pub servers: HashMap<String, ServerConf>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Cache {
 	notifications: Vec<Notification>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct GatewayConf {
-	pub port: u16,
-	pub pw_sha256: [u8; 32],
-}
-
-impl Default for GatewayConf {
-	fn default() -> Self {
-		Self {
-			port: 23786,
-			pw_sha256: hash_pw("12345678"),
-		}
-	}
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

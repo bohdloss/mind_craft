@@ -1,21 +1,28 @@
-use std::mem::replace;
+use std::mem::{MaybeUninit, replace};
 use std::net::TcpStream;
+use std::process;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
-use ende::{BitWidth, Context, Encoder};
+use ende::{BinSettings, BitWidth, Context, Encoder, NumEncoding, SizeRepr, VariantRepr};
 use ende::io::Std;
 use openssl::rsa::{Padding, Rsa};
 use yapper::{LoginPacket, LoginResponse, NetCommand, recv_packet, Response, ServerCommand, ServerStatus, Status};
 use yapper::conf::Config;
-use crate::config::{GatewayConf, SVManage};
-use crate::server_loop::{Command, NOTIFICATIONS, Server};
+use crate::config::{SVManage};
+use crate::ctxt::Ctxt;
+use crate::server_loop::{Command, get_notifs, NOTIFICATIONS, Server};
 
 const KEY_PEM: &[u8] = include_bytes!("../sv_manage_private.pem");
 
-pub fn client_loop(client: TcpStream, conf: Config<SVManage>, servers: &[Server]) -> Result<()> {
-	let mut ctxt = Context::new();
-	ctxt.settings.variant_repr.width = BitWidth::Bit128;
-	// ctxt.settings.size_repr.num_encoding = NumEncoding::Leb128;
+pub fn client_loop(client: TcpStream, ctx: Arc<Ctxt>) -> Result<()> {
+	let mut ctxt = Context::new()
+		.settings(BinSettings::new()
+			.variant_repr(VariantRepr::new()
+				.bit_width(BitWidth::Bit8))
+			.size_repr(SizeRepr::new()
+				.num_encoding(NumEncoding::Leb128)));
 	let mut encoder = Encoder::new(Std::new(client), ctxt);
 
 	// Oh boy
@@ -34,25 +41,32 @@ pub fn client_loop(client: TcpStream, conf: Config<SVManage>, servers: &[Server]
 
 	// Packet exchange here
 
+	let mut account_name = None;
 	recv_packet(&mut client, &aes, ctxt, |login: LoginPacket| {
-		if login.user == "root" && login.password == conf.with_config(|x| x.gateway.pw_sha256) {
-			Ok(LoginResponse::Ok)
-		} else {
-			Err((
-				anyhow!(r#"Wrong credentials {:?}:{:?}"#, login.user, login.password),
-				LoginResponse::WrongCredentials)
-			)
-		}
+		ctx.config.with_config(|conf| {
+			if let Some(account) = conf.accounts.get(&login.user) && account.password == login.password {
+				account_name = Some(login.user);
+				Ok(LoginResponse::Ok)
+			} else {
+				Err((
+					anyhow!(r#"Wrong credentials {:?}:{:?}"#, login.user, login.password),
+					LoginResponse::WrongCredentials)
+				)
+			}
+		})
 	})?;
-
+	let account = account_name.unwrap();
+	
+	let ref servers = ctx.servers[&account];
+	
 	recv_packet(&mut client, &aes, ctxt, |command: NetCommand| {
 		match &command {
 			NetCommand::ListServers => {
 				let mut list = Vec::with_capacity(servers.len());
-				for server in servers {
+				for server in servers.iter() {
 					list.push(ServerStatus {
 						name: server.name().to_owned(),
-						path: server.conf().with_config(|x| x.servers[server.name()].path.clone()),
+						path: server.conf().with_config(|x| x.accounts[&account].servers[server.name()].path.clone()),
 						status: server.status(),
 					});
 				}
@@ -64,33 +78,17 @@ pub fn client_loop(client: TcpStream, conf: Config<SVManage>, servers: &[Server]
 					let status = server.status();
 					match cmd {
 						ServerCommand::Start => {
-							match status {
-								Status::Idle | Status::Stopping => {
-									server.start();
-									Ok(Response::Ok)
-								}
-								_ => Err((
-									anyhow!("Trying to start with invalid status {status}"),
-									Response::InvalidState,
-								))
-							}
+							server.start();
+							Ok(Response::Ok)
 						}
 						ServerCommand::Stop => {
-							match status {
-								Status::Starting | Status::Running => {
-									server.stop();
-									Ok(Response::Ok)
-								}
-								_ => Err((
-									anyhow!("Trying to quot with invalid status {status}"),
-									Response::InvalidState,
-								))
-							}
+							server.stop();
+							Ok(Response::Ok)
 						}
 						ServerCommand::Status => {
 							Ok(Response::Status(ServerStatus {
 								name: server.name().to_owned(),
-								path: server.conf().with_config(|x| x.servers[server.name()].path.clone()),
+								path: server.conf().with_config(|x| x.accounts[&account].servers[server.name()].path.clone()),
 								status: server.status()
 							}))
 						}
@@ -140,6 +138,48 @@ pub fn client_loop(client: TcpStream, conf: Config<SVManage>, servers: &[Server]
 								.map_err(|err| (err, Response::Err))?;
 							Ok(x)
 						}
+						ServerCommand::ListMods(per_page, pages) => {
+							use anyhow::Context;
+							let x = server.send(Command::ListMods(*per_page, *pages), Duration::from_secs(5))
+								.context("Failed to send command")
+								.map_err(|err| (err, Response::Err))?;
+							Ok(x)
+						}
+						ServerCommand::InstallMod(filename, preferred_name) => {
+							use anyhow::Context;
+							let x = server.send(Command::InstallMod(filename.clone(), preferred_name.clone()), Duration::from_secs(5))
+								.context("Failed to send command")
+								.map_err(|err| (err, Response::Err))?;
+							Ok(x)
+						}
+						ServerCommand::UninstallMod(mod_id) => {
+							use anyhow::Context;
+							let x = server.send(Command::UninstallMod(mod_id.clone()), Duration::from_secs(5))
+								.context("Failed to send command")
+								.map_err(|err| (err, Response::Err))?;
+							Ok(x)
+						}
+						ServerCommand::UpdateMod(filename, preferred_name) => {
+							use anyhow::Context;
+							let x = server.send(Command::UpdateMod(filename.clone(), preferred_name.clone()), Duration::from_secs(5))
+								.context("Failed to send command")
+								.map_err(|err| (err, Response::Err))?;
+							Ok(x)
+						}
+						ServerCommand::QueryMod(mod_id) => {
+							use anyhow::Context;
+							let x = server.send(Command::QueryMod(mod_id.clone()), Duration::from_secs(5))
+								.context("Failed to send command")
+								.map_err(|err| (err, Response::Err))?;
+							Ok(x)
+						}
+						ServerCommand::GenerateModsZip => {
+							use anyhow::Context;
+							let x = server.send(Command::GenerateModsZip, Duration::from_secs(5))
+								.context("Failed to send command")
+								.map_err(|err| (err, Response::Err))?;
+							Ok(x)
+						}
 					}
 				} else {
 					Err((
@@ -149,7 +189,7 @@ pub fn client_loop(client: TcpStream, conf: Config<SVManage>, servers: &[Server]
 				}
 			}
 			NetCommand::Notifications => {
-				let notifs = replace(&mut *NOTIFICATIONS.lock().unwrap(), Vec::new());
+				let notifs = get_notifs(&account);
 				
 				Ok(Response::Notifications(notifs))
 			}

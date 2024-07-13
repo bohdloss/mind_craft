@@ -2,8 +2,9 @@ use std::net::TcpStream;
 
 use anyhow::{bail, Result};
 use ende::io::Std;
-use ende::{BitWidth, Context, Encoder};
+use ende::{BinSettings, BitWidth, Context, Encoder, NumEncoding, SizeRepr, VariantRepr};
 use openssl::rsa::{Padding, Rsa};
+use serenity::all::GuildId;
 use yapper::{hash_pw, send_packet, LoginPacket, LoginResponse, NetCommand, Response};
 
 const IP: &str = "127.0.0.1:23786";
@@ -22,12 +23,24 @@ macro_rules! send_cmd {
     }};
 }
 pub(crate) use send_cmd;
+use yapper::conf::Config;
+use crate::conf::MCAYB;
 
-pub fn send_command(cmd: NetCommand) -> Result<Response> {
+fn login(conf: &Config<MCAYB>, guild_id: GuildId) -> (String, [u8; 32]) {
+    conf.with_config(|conf| {
+        let ref data = conf.guild_data[&guild_id];
+        (data.sv_user.clone(), data.sv_pass)
+    })
+}
+
+pub fn send_command(conf: &Config<MCAYB>, guild: GuildId, cmd: NetCommand) -> Result<Response> {
     let client = TcpStream::connect(IP)?;
-    let mut ctxt = Context::new();
-    ctxt.settings.variant_repr.width = BitWidth::Bit128;
-    // ctxt.settings.size_repr.num_encoding = NumEncoding::Leb128;
+    let mut ctxt = Context::new()
+        .settings(BinSettings::new()
+            .variant_repr(VariantRepr::new()
+                .bit_width(BitWidth::Bit8))
+            .size_repr(SizeRepr::new()
+                .num_encoding(NumEncoding::Leb128)));
     let mut encoder = Encoder::new(Std::new(client), ctxt);
 
     // Generate aes key
@@ -44,11 +57,10 @@ pub fn send_command(cmd: NetCommand) -> Result<Response> {
     let mut client = encoder.finish().0.into_inner();
 
     // Begin packet exchange
-
-    let hash = hash_pw("My(NotSo)HardWorkByTheseWordsGuardedPlsDontHack");
+    let (acc, pw) = login(conf, guild);
     let login = LoginPacket {
-        user: "root".to_string(),
-        password: hash,
+        user: acc,
+        password: pw,
     };
 
     let login = send_packet(&mut client, &aes, ctxt, login)?;

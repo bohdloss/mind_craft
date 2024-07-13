@@ -5,18 +5,32 @@ pub mod conf;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::io::{Read, Write};
+use std::mem;
 use std::net::TcpStream;
-
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+use anyhow::{anyhow, bail, Result};
+use base64::Engine;
+use base64::engine::general_purpose;
 use bytemuck::NoUninit;
 use ende::{Context, Decode, Encode, Encoder};
-use ende::io::VecStream;
+use ende::io::{SizeLimit, Std, VecStream};
 use openssl::rand::rand_bytes;
 use openssl::symm;
 use openssl::symm::Cipher;
 use parse_display::Display;
 use serde::{Deserialize, Serialize};
+use sha2::digest::typenum::private::Trim;
 use sha2::Sha256;
+
+pub fn base64_encode<T: AsRef<[u8]>>(t: T) -> String {
+	let encoder = general_purpose::URL_SAFE;
+	encoder.encode(t)
+}
+
+pub fn base64_decode(t: &str) -> Vec<u8> {
+	let encoder = general_purpose::URL_SAFE;
+	encoder.decode(t).unwrap()
+}
 
 pub fn pretty_status(status: Status) -> String {
 	match status {
@@ -26,6 +40,8 @@ pub fn pretty_status(status: Status) -> String {
 		Status::Starting => ":stopwatch: **Starting**",
 		Status::BackingUp => ":floppy_disk: **Creating backup**",
 		Status::Restoring => ":leftwards_arrow_with_hook: **Restoring backup**",
+		Status::Modding => ":stopwatch: **Modding**",
+		Status::Packaging => ":package: **Packaging**",
 	}.to_string()
 }
 
@@ -107,6 +123,12 @@ pub enum ServerCommand {
 	Console(String),
 	Backup,
 	Restore,
+	ListMods(u64, u64),
+	QueryMod(String),
+	InstallMod(String, String),
+	UninstallMod(String),
+	UpdateMod(String, String),
+	GenerateModsZip,
 }
 
 impl Packet for NetCommand {
@@ -120,6 +142,38 @@ pub enum Notification {
 	StatusChanged(String, Status, Status),
 	BackupProgress(String, u64, u64),
 	RestoreProgress(String, u64, u64),
+	ZipProgress(String, ZipProgress),
+	ZipFailed(String, String),
+	ZipFile(String, String),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Encode, Decode, Serialize, Deserialize)]
+pub enum ZipProgress {
+	Zipping(u64, u64),
+	Uploading(u64, u64),
+}
+
+impl core::fmt::Display for ZipProgress {
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		match self {
+			ZipProgress::Zipping(copied, total) => {
+				write!(f,
+				       "{:.2}Mb packaged out of {:.2}Mb ({:.2}%)",
+				       *copied as f32 / (1024.0 * 1024.0),
+				       *total as f32 / (1024.0 * 1024.0),
+				       (*copied as f32 / *total as f32) * 100.0,
+				)
+			}
+			ZipProgress::Uploading(copied, total) => {
+				write!(f,
+				       "{:.2}Mb uploaded out of {:.2}Mb ({:.2}%)",
+				       *copied as f32 / (1024.0 * 1024.0),
+				       *total as f32 / (1024.0 * 1024.0),
+				       (*copied as f32 / *total as f32) * 100.0,
+				)
+			}
+		}
+	}
 }
 
 impl Notification {
@@ -133,6 +187,13 @@ impl Notification {
 	pub fn is_restore_progress(&self) -> bool {
 		match self {
 			Notification::RestoreProgress(..) => true,
+			_ =>  false,
+		}
+	}
+
+	pub fn is_package_progress(&self) -> bool {
+		match self {
+			Notification::ZipProgress(..) => true,
 			_ =>  false,
 		}
 	}
@@ -168,6 +229,24 @@ impl core::fmt::Display for Notification {
 				       (*copied as f32 / *total as f32) * 100.0,
 				)
 			}
+			Notification::ZipProgress(server, progress) => {
+				write!(f, 
+				       "Server `{}` package progress: {progress}",
+					   escape_discord(server)
+				)
+			}
+			Notification::ZipFailed(server, error) => {
+				write!(f,
+				       "Package failed for  `{}` with error: {error}",
+				       escape_discord(server)
+				)
+			}
+			Notification::ZipFile(server, url) => {
+				write!(f,
+				       "Download ready for `{}`'s mod-pack: {url}",
+				       escape_discord(server)
+				)
+			}
 		}
 	}
 }
@@ -186,7 +265,274 @@ pub enum Response {
 	#[display("CommandOutput({0:?})")]
 	CommandOutput(String),
 	#[display("Notifications({0:?})")]
-	Notifications(Vec<Notification>)
+	Notifications(Vec<Notification>),
+	ModConflict,
+	NoSuchMod,
+	#[display("Mods({0:?})")]
+	Mods(Vec<ModInfo>, bool),
+	#[display("Mod({0:?})")]
+	Mod(ModInfo),
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Encode, Decode)]
+pub struct ModInfo {
+	pub filename: String,
+	pub path: PathBuf,
+	pub mod_id: String,
+	pub name: Option<String>,
+	pub description: Option<String>,
+	pub version: Option<String>,
+	pub logo: Option<Vec<u8>>,
+	pub url: Option<String>,
+	pub credits: Option<String>,
+	pub authors: Option<Vec<String>>
+}
+
+pub fn parse_mod(path: &Path) -> Result<ModInfo> {
+	use anyhow::Context;
+	let file = std::fs::File::open(path).context("Failed to reopen the newly downloaded mod")?;
+	let mut archive = zip::ZipArchive::new(file).context("Failed to parse zip file")?;
+
+	let mut mod_info = archive
+		.by_name("META-INF/mods.toml")
+		.context("Couldn't find mod metadata")?;
+	let mut mods_toml = String::new();
+	mod_info
+		.read_to_string(&mut mods_toml)
+		.context("Failed to read mod metadata")?;
+	drop(mod_info);
+
+	let mut data: Result<ModsToml> = toml::from_str(&mods_toml).context("Failed to parse mods.toml");
+	let mut data = match data {
+		Ok(data) => data,
+		_ => {
+			let data: ModsTomlButCreditList = toml::from_str(&mods_toml).context("Failed to parse mods.toml (again)")?;
+			let mut convert = Vec::new();
+			for x in data.mods {
+				let ModsButCreditsList {
+					mod_id,
+					version,
+					display_name,
+					logo_file,
+					description,
+					display_url,
+					credits,
+					authors,
+				} = x;
+
+				let credits = if let Some(credits) = credits {
+					let mut string = String::new();
+					let mut first = true;
+					for x in credits {
+						if first {
+							first = false;
+							string.push_str(&x);
+						} else {
+							string.push_str(&format!(", {x}"));
+						}
+					}
+					Some(string)
+				} else { None };
+				
+				convert.push(Mods {
+					mod_id,
+					version,
+					display_name,
+					logo_file,
+					description,
+					display_url,
+					credits,
+					authors,
+				})
+			}
+			ModsToml { mods: convert }
+		}
+	};
+
+	if data.mods.len() != 1 {
+		bail!(
+            "Expected to find metadata for 1 mod but found metadata for {}",
+            data.mods.len()
+        );
+	}
+
+	let mut mods = data.mods.remove(0);
+
+	let logo_data = if let Some(logo) = mods.logo_file {
+		let x: Result<Vec<u8>> = try {
+			let mut logo_file = archive
+				.by_name(&logo)
+				.context("Couldn't read logo file")?;
+			let mut logo_data = Vec::new();
+			
+			// 10 MB limit
+			// let mut logo_file = Std::new(SizeLimit::new(Std::new(logo_file), 0, 1024 * 1024 * 10));
+			
+			logo_file
+				.read_to_end(&mut logo_data)
+				.context(format!("Failed to read logo data: {logo}"))?;
+			logo_data
+		};
+		x.ok()
+	} else { None };
+	
+	// let img = image::io::Reader::new(Cursor::new(&logo_data)).decode().context("Failed to load logo image")?;
+	// let mut png = Vec::new();
+	// img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).context("Failed to convert image to png")?;
+
+	let version = if let Some(version) = mods.version {
+		let x: Result<String> = try {
+			let mut the_version = version;
+			if the_version.trim() == "${file.jarVersion}" {
+				let mut manifest = archive
+					.by_name("META-INF/MANIFEST.MF")
+					.context("Couldn't open jar manifest")?;
+				let mut manifest_data = String::new();
+				manifest
+					.read_to_string(&mut manifest_data)
+					.context("Failed to read manifest data")?;
+				for line in manifest_data.split("\n") {
+					if line.starts_with("Implementation-Version: ") {
+						if let Some(version) = line.trim().split(" ").nth(1) {
+							the_version = version.to_owned();
+							break;
+						}
+					}
+				}
+			}
+			the_version
+		};
+		x.ok()
+	} else { None };
+	
+	let filename: Result<String> = try {
+		path
+			.file_name()
+			.ok_or(anyhow!("Couldn't get file name"))?
+			.to_str()
+			.ok_or(anyhow!("Couldn't convert to string"))?
+			.to_string()
+	};
+	let filename = filename.unwrap_or(format!("{}.jar", mods.mod_id));
+
+	let authors = mods.authors.map(|authors| {
+		authors
+			.split(",")
+			.map(|string| string.trim())
+			.map(|string| string.to_owned())
+			.collect()
+	});
+
+
+	Ok(ModInfo {
+		filename,
+		path: path.canonicalize().context("Couldn't canonicalize path")?,
+		mod_id: mods.mod_id,
+		name: mods.display_name,
+		description: mods.description,
+		version,
+		logo: logo_data,
+		url: mods.display_url,
+		credits: mods.credits,
+		authors
+	})
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModsTomlButCreditList {
+	mods: Vec<ModsButCreditsList>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModsToml {
+	mods: Vec<Mods>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ModsButCreditsList {
+	#[serde(rename = "modId")]
+	mod_id: String,
+	#[serde(rename = "version")]
+	version: Option<String>,
+	#[serde(rename = "displayName")]
+	display_name: Option<String>,
+	#[serde(rename = "logoFile")]
+	logo_file: Option<String>,
+	#[serde(rename = "description")]
+	description: Option<String>,
+	#[serde(rename = "displayURL")]
+	display_url: Option<String>,
+	#[serde(rename = "credits")]
+	credits: Option<Vec<String>>,
+	#[serde(rename = "authors")]
+	authors: Option<String>
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Mods {
+	#[serde(rename = "modId")]
+	mod_id: String,
+	#[serde(rename = "version")]
+	version: Option<String>,
+	#[serde(rename = "displayName")]
+	display_name: Option<String>,
+	#[serde(rename = "logoFile")]
+	logo_file: Option<String>,
+	#[serde(rename = "description")]
+	description: Option<String>,
+	#[serde(rename = "displayURL")]
+	display_url: Option<String>,
+	#[serde(rename = "credits")]
+	credits: Option<String>,
+	#[serde(rename = "authors")]
+	authors: Option<String>
+}
+
+#[repr(transparent)]
+pub struct DelOnDropOwned(PathBuf);
+
+impl DelOnDropOwned {
+	pub fn new(path: PathBuf) -> Self {
+		Self(path)
+	}
+
+	pub fn forgive(self) {
+		// Safety
+		// This is safe because Self is repr(transparent) with a PathBuf
+		let _path: PathBuf = unsafe { mem::transmute(self) };
+	}
+}
+
+impl Drop for DelOnDropOwned {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_file(&self.0);
+	}
+}
+
+#[repr(transparent)]
+pub struct DelOnDrop<'a>(&'a Path);
+
+impl<'a> DelOnDrop<'a> {
+	pub fn new(path: &'a Path) -> Self {
+		Self(path)
+	}
+
+	pub fn forgive(self) {
+		// No memory is leaked because we only store a reference
+		mem::forget(self)
+	}
+}
+
+impl Drop for DelOnDrop<'_> {
+	fn drop(&mut self) {
+		let _ = std::fs::remove_file(self.0);
+	}
+}
+
+impl core::fmt::Display for ModInfo {
+	fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+		core::fmt::Debug::fmt(self, f)
+	}
 }
 
 impl PacketResponse for Response {}
@@ -200,6 +546,8 @@ pub enum Status {
 	Stopping,
 	BackingUp,
 	Restoring,
+	Modding,
+	Packaging
 }
 
 #[derive(Encode, Decode)]

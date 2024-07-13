@@ -2,9 +2,13 @@
 #![feature(gen_blocks)]
 #![feature(let_chains)]
 
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::mem::MaybeUninit;
 use std::net::TcpListener;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::Ordering;
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -46,31 +50,38 @@ fn main_wrapper() -> Result<()> {
         .context("Failed to load configuration")?;
     
     let mut ctxt = Ctxt {
+        check: 42,
         lock,
         config,
-        servers: Vec::new(),
+        servers: HashMap::new(),
     };
 
-    let server = TcpListener::bind(format!("127.0.0.1:{}", ctxt.config.with_config(|x| x.gateway.port)))?;
+    let server = TcpListener::bind(format!("127.0.0.1:{}", ctxt.config.with_config(|x| x.port)))?;
 
     // Start up each server
-    let names: Vec<String> = ctxt.config.with_config(|x| x.servers.keys().map(Clone::clone).collect());
-    for name in names {
-        let server = Server::new(name, ctxt.config.clone());
-        ctxt.servers.push(server);
-    }
-
-    thread::scope(|s| {
-        loop {
-            if let Ok((client, _)) = server.accept() {
-                s.spawn(|| {
-                    if let Err(err) = client_loop(client, ctxt.config.clone(), &ctxt.servers) {
-                        dispatch_debug(err);
-                    }
-                });
+    ctxt.config.with_config(|x| {
+        for (account_name, account) in x.accounts.iter() {
+            let mut vec = Vec::new();
+            for (server_name, server) in account.servers.iter() {
+                let server = Server::new(account_name.clone(), server_name.clone(), ctxt.config.clone(), server);
+                vec.push(server);
             }
+            ctxt.servers.insert(account_name.clone(), vec);
         }
     });
+    
+    let ctx = Arc::new(ctxt);
+    
+    loop {
+        if let Ok((client, _)) = server.accept() {
+            let ctx = ctx.clone();
+            thread::spawn(move || {
+                if let Err(err) = client_loop(client, ctx) {
+                    dispatch_debug(err);
+                }
+            });
+        }
+    }
 
     // let mut errors = Vec::with_capacity(ctxt.servers.len());
     // for server in ctxt.servers {

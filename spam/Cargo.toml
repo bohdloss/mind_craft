@@ -1,0 +1,21 @@
+[package]
+name = "spam"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.38.0", features = ["full"] }
+axum = { version = "0.7.5", features = ["multipart"] }
+uuid = { version = "1.10.0", features = ["serde", "v4"] }
+tokio-util = { version = "0.7.11", features = ["io"] }
+http-body-util = "0.1.2"
+yapper = { path = "../yapper" }
+serde = { version = "1.0.204", features = ["derive"] }
+bitflags = { version = "2.6.0", features = ["serde"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+base64 = "0.22.1"
+anyhow = "1.0.86"
+axum-server = { version = "0.6.0", features = ["tls-openssl"] }
+openssl = "0.10.64"
+file-guard = "0.2.0"
+expanduser = "1.2.2"

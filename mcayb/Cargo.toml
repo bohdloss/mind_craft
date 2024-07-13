@@ -22,6 +22,11 @@ async-scoped = { version = "0.9.0", features = ["use-tokio"] }
 base64 = "0.22.1"
 rand = "0.8.5"
 once_cell = "1.19.0"
-reqwest = "0.12.5"
+reqwest = { version = "0.12.5", features = ["stream"] }
 is-url = "1.0.4"
 url = "2.5.2"
+allocvec = { path = "../../allocvec" }
+tokio-util = { version = "0.7.11", features = ["compat"] }
+zip = "2.1.3"
+toml = "0.8.14"
+image = "0.25.1"

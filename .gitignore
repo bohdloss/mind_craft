@@ -22,5 +22,9 @@ Cargo.lock
 
 *.pem
 *.token
+*.zip
+*.bin
 sv_manage.json
 mcayb.json
+spam.json
+spam/assets/
