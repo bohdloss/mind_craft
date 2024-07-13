@@ -536,7 +536,7 @@ fn upload_zip(account: &str, server: &str) -> Result<String>
 		let string = core::str::from_utf8(bytes.as_ref()).context("Failed to read response body as utf-8")?;
 		let uuid = Uuid::from_str(string).context("Response body wasn't a UUID")?;
 
-		Ok(format!("https://127.0.0.1:7216/assets/mods/{uuid}"))
+		Ok(format!("https://{}/assets/mods/{uuid}", include_str!("../ip.token")))
 	} else {
 		bail!("Failed to post mods.zip: {}", response.status())
 	}

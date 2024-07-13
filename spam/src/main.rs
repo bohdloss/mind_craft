@@ -4,7 +4,7 @@
 mod config;
 
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Mutex;
@@ -57,7 +57,7 @@ async fn main() {
 		.fallback(get(wtf_unknown_page))
 		.with_state(config);
 
-	axum_server::bind_openssl(SocketAddr::from(([127, 0, 0, 1], 7216)), OpenSSLConfig::from_pem(include_bytes!("../cert.pem"), include_bytes!("../key.pem")).unwrap())
+	axum_server::bind_openssl(SocketAddr::from(SocketAddrV4::from_str(include_str!("../ip.token")).unwrap()), OpenSSLConfig::from_pem(include_bytes!("../cert.pem"), include_bytes!("../key.pem")).unwrap())
 		.serve(base_router.into_make_service())
 		.await
 		.expect("Serve failed");
