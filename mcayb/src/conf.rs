@@ -20,7 +20,7 @@ use yapper::{base64_decode, base64_encode, ServerStatus};
 const LOCK: &str = "~/.mcayb.lock";
 pub const CONFIG: &str = "mcayb.json";
 
-pub const VERSION: Version = Version::new(1, 1, 0);
+pub const VERSION: Version = Version::new(1, 2, 0);
 
 pub fn acquire_lock() -> Result<FileGuard<Box<File>>> {
     use anyhow::Context;

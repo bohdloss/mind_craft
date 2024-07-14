@@ -1,4 +1,4 @@
-use std::{fmt::format, future::Future, io::{self, ErrorKind}, mem, str::FromStr, sync::Arc, time::{Duration, SystemTime}};
+use std::{fmt::format, future, future::Future, io::{self, ErrorKind}, mem, str::FromStr, sync::Arc, time::{Duration, SystemTime}};
 use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::{Ordering, PartialEq};
@@ -1874,12 +1874,21 @@ async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, 
         };
 
         // *What does everyone mean?? for now, it means every member, excluding the bot itself
-        let user_count = guild.members_iter(http.http()).count().await;
+        let member_count = guild.members_iter(http.http()).filter(|member| future::ready(
+            if let Ok(member) = member && !member.user.bot {
+                true
+            } else {
+                false
+            }
+        )).count().await;
+        
+        let min_count = (member_count / 2) + (member_count % 2);
+        
 	    let vote_count: usize = results.answer_counts.iter().map(|x| x.count as usize).sum();
-
+        
         // If everyone* voted, and the poll is not yet finalized, end the poll now
         if !results.is_finalized {
-            if 2 == vote_count {
+            if vote_count >= min_count {
                 let _ = poll_message.end_poll(http.http()).await;
             } else {
                 return;
@@ -1921,7 +1930,7 @@ async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, 
             .unwrap_or(0);
         
         match yes_answer.cmp(&no_answer) {
-            Ordering::Greater => {
+            Ordering::Greater if vote_count >= min_count => {
                 let null_history = MenuHistory::new("null");
                 match poll.kind {
                     PollKind::Install => {
@@ -1973,8 +1982,20 @@ async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, 
                     let _ = channel.send_message(&http, msg).await;
                 }
             }
-            Ordering::Less => {}
-            Ordering::Equal => {}
+            Ordering::Greater => {
+                if let Some(channel) = channel {
+                    let members = if vote_count == 1 {
+                        "member"  
+                    } else {
+                        "members"
+                    };
+                    let msg = info_menu(&format!("Poll won, but only {vote_count} {members} voted, expected at least {min_count} votes"))
+                        .message()
+                        .reference_message(&poll_message);
+                    let _ = channel.send_message(&http, msg).await;
+                }
+            }
+            _ => {}
         }
     }
 }

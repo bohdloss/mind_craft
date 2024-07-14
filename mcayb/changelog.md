@@ -1,1 +1,5 @@
-- Added this message!
+- Fixed polls
+  - Polls will only pass if the majority* of the players vote
+  - The result of the poll still needs to be positive
+  - *Majority means `member_count / 2` rounded up if the member count is odd
+  - Bots do not count
