@@ -583,7 +583,7 @@ where F: Fn() -> Result<PathBuf>
 			filename.push_str(".jar");
 		}
 
-		let mods_folder = mods()?.join("mods");
+		let mods_folder = mods()?;
 		ensure_dir(&mods_folder).context("Error creating mods folder")?;
 
 		let to_install = parse_mod(&mod_path)?;
@@ -625,7 +625,7 @@ where F: Fn() -> Result<PathBuf>
 			filename.push_str(".jar");
 		}
 
-		let mods_folder = mods()?.join("mods");
+		let mods_folder = mods()?;
 		ensure_dir(&mods_folder).context("Error creating mods folder")?;
 
 		let to_install = parse_mod(&mod_path)?;
@@ -660,7 +660,7 @@ where F: Fn() -> Result<PathBuf>
 {
 	let r: Result<Response> = try {
 
-		let mods_folder = mods()?.join("mods");
+		let mods_folder = mods()?;
 		ensure_dir(&mods_folder).context("Error creating mods folder")?;
 
 		let all = list_mods(&mods_folder)?;
