@@ -11,12 +11,16 @@ use std::{
     path::Path,
 };
 use std::fmt::Formatter;
+use std::str::FromStr;
 use ende::{Decode, Encode};
+use semver::Version;
 use serde::de::{Error, MapAccess, Visitor};
 use yapper::{base64_decode, base64_encode, ServerStatus};
 
 const LOCK: &str = "~/.mcayb.lock";
 pub const CONFIG: &str = "mcayb.json";
+
+pub const VERSION: Version = Version::new(1, 1, 0);
 
 pub fn acquire_lock() -> Result<FileGuard<Box<File>>> {
     use anyhow::Context;
@@ -34,9 +38,19 @@ pub fn acquire_lock() -> Result<FileGuard<Box<File>>> {
     )
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MCAYB {
+    pub version: Version,
     pub guild_data: HashMap<GuildId, GuildData>,
+}
+
+impl Default for MCAYB {
+    fn default() -> Self {
+        Self {
+            version: VERSION,
+            guild_data: HashMap::default(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]

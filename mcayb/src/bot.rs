@@ -3,6 +3,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::cmp::{Ordering, PartialEq};
 use std::collections::{HashMap, VecDeque};
+use std::mem::replace;
 use std::ops::{Deref};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
@@ -34,7 +35,7 @@ use url::{Host, Url};
 use yapper::{base64_decode, base64_encode, DelOnDrop, dispatch_debug, escape_discord, ModInfo, NetCommand, Notification, pretty_status, Response, ServerCommand, ServerStatus, Status};
 use yapper::conf::Config;
 use crate::{comm::{send_cmd, send_command}, conf::{MCAYB}, process_mods};
-use crate::conf::{ModKey, ModPoll, PollKind};
+use crate::conf::{ModKey, ModPoll, PollKind, VERSION};
 
 const TOKEN: &str = include_str!("../discord.token");
 
@@ -872,7 +873,7 @@ impl EventHandler for Handler {
             return;
         }
 
-        poll_deleted(&ctx, &self.conf, guild_id, deleted_message_id).await;
+        poll_deleted(&ctx, &self.conf, guild_id, channel_id, deleted_message_id).await;
     }
 
     async fn poll_vote_add(&self, ctx: Context, event: MessagePollVoteAddEvent) {
@@ -1498,16 +1499,39 @@ async fn account_thread(http: Arc<Http>, conf: Config<MCAYB>) {
     let data = conf.with_config(|conf| {
         conf.guild_data.clone()
     });
-
-    let mut guilds = Vec::new();
     
-    for (guild, data) in data {
-        guilds.push(guild);
-        for (_, poll) in data.mod_polls {
-            poll_deleted(&http, &conf, guild, poll.poll).await;
+    let mut guilds = Vec::new();
+
+    // Check for deleted polls and polls that have already ended
+    for (guild, data) in data.iter() {
+        guilds.push(*guild);
+        for (_, poll) in data.mod_polls.iter() {
+            if !poll_deleted(&http, &conf, *guild, poll.channel, poll.poll).await {
+                check_poll(&http, &conf, *guild, poll.channel, poll.poll).await;
+            }
         }
     }
+    
+    // Check if this is a new version
+    let old_version = conf.with_config_mut(|conf| {
+        let version = replace(&mut conf.version, VERSION);
+        version != VERSION
+    }).expect("Failed to update version in config");
 
+    if old_version {
+        for data in data.values() {
+            if let Some(channel) = data.notifications {
+                let title = format!("Bot updated to `{VERSION}`!");
+                let msg = Menu::new((28, 201, 121), title, Some(include_str!("../changelog.md").to_owned()))
+                    .footer(&VERSION.to_string())
+                    .build(&MenuHistory::new("null"), false, false)
+                    .message();
+                
+                let _ = channel.send_message(&http, msg).await;
+            }
+        }
+    }
+    
     let mut last_status: HashMap<GuildId, Vec<ServerStatus>> = conf.with_config(|x| x.guild_data.iter().map(|(id, data)| (*id, data.last_status.clone())).collect());
     let mut last = SystemTime::now();
     
@@ -1772,11 +1796,11 @@ async fn create_poll(http: &Http, conf: &Config<MCAYB>, channel: ChannelId, msgs
     del.map(|del| del.forgive());
 }
 
-async fn poll_deleted(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, deleted_poll: MessageId) {
+async fn poll_deleted(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, the_channel: ChannelId, deleted_poll: MessageId) -> bool {
     let (channel, key, poll) = conf.with_config(|conf| {
         let ref guild_data = conf.guild_data[&guild];
         for (key, poll) in guild_data.mod_polls.iter() {
-            if poll.poll == deleted_poll {
+            if poll.channel == the_channel && poll.poll == deleted_poll {
                 return (guild_data.notifications, Some(key.clone()), Some(poll.clone()));
             }
         }
@@ -1786,7 +1810,7 @@ async fn poll_deleted(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId
     if let Some(key) = key && let Some(poll) = poll {
         let msg = http.http().get_message(poll.channel, poll.poll).await;
         if msg.is_ok() {
-            return;
+            return false;
         }
 
         let del = if poll.kind == PollKind::Install {
@@ -1811,6 +1835,7 @@ async fn poll_deleted(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId
             let _ = channel.send_message(http, msg).await;
         }
     }
+    true
 }
 
 async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, the_channel: ChannelId, the_poll: MessageId) {

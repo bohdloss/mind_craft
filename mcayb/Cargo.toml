@@ -30,3 +30,4 @@ tokio-util = { version = "0.7.11", features = ["compat"] }
 zip = "2.1.3"
 toml = "0.8.14"
 image = "0.25.1"
+semver = { version = "1.0.23", features = ["serde"] }
