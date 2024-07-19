@@ -1,41 +1,37 @@
-use std::{fmt::format, future, future::Future, io::{self, ErrorKind}, mem, str::FromStr, sync::Arc, time::{Duration, SystemTime}};
-use std::any::Any;
-use std::cell::RefCell;
+use std::{future, io::{self, ErrorKind}, str::FromStr, sync::Arc, time::{Duration, SystemTime}};
 use std::cmp::{Ordering, PartialEq};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::mem::replace;
-use std::ops::{Deref};
+use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard};
+
 use allocvec::AllocVec;
 use anyhow::{anyhow, bail, Result};
-use async_scoped::TokioScope;
-use base64::{engine::general_purpose, Engine};
-use ende::{io::{Slice, VecStream}, Decode, Encode, Encoder};
-use is_url::is_url;
+use ende::{Decode, Encode};
 use once_cell::sync::Lazy;
 use parse_display::Display;
-use rand::{thread_rng, Rng, SeedableRng};
-use rand::distributions::Uniform;
+use rand::{Rng, SeedableRng, thread_rng};
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
 use serenity::{
     all::{
-        ActionRowComponent, ButtonStyle, CacheHttp, CommandInteraction, ComponentInteractionDataKind, Context, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateInputText, CreateInteractionResponse, CreateInteractionResponseFollowup, CreateInteractionResponseMessage, CreateMessage, CreateModal, CreateSelectMenu, CreateSelectMenuKind, CreateSelectMenuOption, EditInteractionResponse, EditMessage, EventHandler, GatewayIntents, InputTextStyle, Interaction, InteractionId, Message, MessageBuilder, Ready
+        ActionRowComponent, ButtonStyle, CacheHttp, CommandInteraction, Context, CreateActionRow, CreateButton, CreateEmbed, CreateEmbedAuthor, CreateEmbedFooter, CreateInputText, CreateInteractionResponse, CreateInteractionResponseMessage, CreateMessage, CreateModal, EditMessage, EventHandler, GatewayIntents, InputTextStyle, Interaction, Message, Ready
     },
     async_trait, Client,
 };
-use serenity::all::{Attachment, AttachmentId, ChannelId, CreateAttachment, CreatePoll, CreatePollAnswer, GuildId, Http, MessageId, MessagePollVoteAddEvent, MessageReference};
+use serenity::all::{Cache, ChannelId, CreateAttachment, CreatePoll, CreatePollAnswer, GuildId, Http, MessageId, MessagePollVoteAddEvent};
 use serenity::futures::StreamExt;
 use serenity_commands::Commands;
-use sha2::digest::Output;
-use tokio::{join, sync::RwLock};
-use tokio::task::{JoinHandle, LocalSet};
+use tokio::join;
+use tokio::sync::{Mutex, MutexGuard};
+use tokio::task::{LocalSet, spawn_local, yield_now};
 use url::{Host, Url};
-use yapper::{base64_decode, base64_encode, DelOnDrop, dispatch_debug, escape_discord, ModInfo, NetCommand, Notification, pretty_status, Response, ServerCommand, ServerStatus, Status};
+
+use yapper::{base64_decode, base64_encode, DelOnDrop, dispatch_debug, escape_discord, ModInfo, NetCommand, Notification, pretty_status, reserved_mod_id, Response, ServerCommand, ServerStatus, Status};
 use yapper::conf::Config;
-use crate::{comm::{send_cmd, send_command}, conf::{MCAYB}, process_mods};
-use crate::conf::{ModKey, ModPoll, PollKind, VERSION};
+
+use crate::{comm::send_command, conf::MCAYB, process_mods};
+use crate::conf::{OngoingPoll, PollKey, PollKind, VERSION};
 
 const TOKEN: &str = include_str!("../discord.token");
 
@@ -77,6 +73,7 @@ impl ProcessedMenu {
         response.components(components)
     }
 
+    #[allow(unused)]
     pub fn edit_message(self) -> EditMessage {
         let mut buttons = self.menu.1;
         if self.refresh {
@@ -120,9 +117,19 @@ impl ProcessedMenu {
         let response = CreateInteractionResponseMessage::new()
             .embed(self.menu.0);
 
+        // let mut button_data = Vec::new();
         let mut components: Vec<CreateActionRow> = Vec::new();
         let mut buttons_split: Vec<CreateButton> = Vec::new();
         for (i, button) in buttons.into_iter().enumerate() {
+            // let button: Button = unsafe { mem::transmute(button) };
+            // let ButtonKind::NonLink { custom_id, .. } = &button.data else { panic!() };
+            // if button_data.contains(custom_id) {
+            //     let menu = MenuHistory::from_id(custom_id);
+            //     println!("Duplicated menu link {menu:?}");
+            // }
+            // button_data.push(custom_id.clone());
+            // let button: CreateButton = unsafe { mem::transmute(button) };
+            
             buttons_split.push(button);
 
             if (i + 1) % 5 == 0 && i != 0 {
@@ -272,8 +279,6 @@ enum AllCommands {
     },
     /// Registers this channel as a receiver for server updates
     UpdateMe,
-    /// Does the opposite of UpdateMe
-    ForgetMe,
     /// Test
     Test,
     /// DebugEndPoll
@@ -286,11 +291,11 @@ enum AllCommands {
 }
 
 impl AllCommands {
-    async fn run(self, http: &Http, conf: &Config<MCAYB>, interaction: &CommandInteraction, guild_id: GuildId) -> CreateInteractionResponseMessage {
+    async fn run(self, shared: &Shared, interaction: &CommandInteraction) -> CreateInteractionResponseMessage {
         let null_menu = MenuHistory::new("null");
         match self {
-            AllCommands::Dashboard => dashboard_menu(&MenuHistory::new("dashboard"), conf, guild_id).await.interaction(),
-            AllCommands::Servers => match send_command(conf, guild_id, NetCommand::ListServers) {
+            AllCommands::Dashboard => dashboard_menu(shared, &MenuHistory::new("dashboard")).await.interaction(),
+            AllCommands::Servers => match send_command(shared, NetCommand::ListServers) {
                 Ok(Response::List(statuses)) => {
                     let mut string = String::new();
 
@@ -311,9 +316,9 @@ impl AllCommands {
                     history: vec![],
                     current: MenuUrl::page("mods", &[&server])
                 };
-                mod_menu(&h, conf, guild_id, &server, 0).await.interaction()
+                mod_menu(shared, &h, &server, 0).await.interaction()
             },
-            AllCommands::Status { server } => match send_command(conf, guild_id, NetCommand::ServerCommand(
+            AllCommands::Status { server } => match send_command(shared, NetCommand::ServerCommand(
                 server.clone(),
                 ServerCommand::Status,
             )) {
@@ -322,7 +327,7 @@ impl AllCommands {
                 Ok(any) => send_unknown(&null_menu, &any).await.interaction(),
                 Err(any) => send_err(&null_menu, &any).await.interaction(),
             },
-            AllCommands::Start { server } => match send_command(conf, guild_id, NetCommand::ServerCommand(
+            AllCommands::Start { server } => match send_command(shared, NetCommand::ServerCommand(
                 server.clone(),
                 ServerCommand::Start,
             )) {
@@ -331,7 +336,7 @@ impl AllCommands {
                 Ok(any) => send_unknown(&null_menu, &any).await.interaction(),
                 Err(any) => send_err(&null_menu, &any).await.interaction(),
             },
-            AllCommands::Stop { server } => match send_command(conf, guild_id, NetCommand::ServerCommand(
+            AllCommands::Stop { server } => match send_command(shared, NetCommand::ServerCommand(
                 server.clone(),
                 ServerCommand::Stop,
             )) {
@@ -340,7 +345,7 @@ impl AllCommands {
                 Ok(any) => send_unknown(&null_menu, &any).await.interaction(),
                 Err(any) => send_err(&null_menu, &any).await.interaction(),
             },
-            AllCommands::Reboot { server } => match send_command(conf, guild_id, NetCommand::ServerCommand(
+            AllCommands::Reboot { server } => match send_command(shared, NetCommand::ServerCommand(
                 server.clone(),
                 ServerCommand::Reboot,
             )) {
@@ -349,7 +354,7 @@ impl AllCommands {
                 Ok(any) => send_unknown(&null_menu, &any).await.interaction(),
                 Err(any) => send_err(&null_menu, &any).await.interaction(),
             },
-            AllCommands::Command { server, command } => match send_command(conf, guild_id, 
+            AllCommands::Command { server, command } => match send_command(shared, 
                 NetCommand::ServerCommand(server.clone(), ServerCommand::Console(command.clone())),
             ) {
                 Ok(Response::CommandOutput(output)) => CreateInteractionResponseMessage::new().content(format!(
@@ -365,8 +370,8 @@ impl AllCommands {
 
                 let channel_id = interaction.channel_id;
 
-                let result = conf.with_config_mut(|conf| {
-                    conf.guild_data.get_mut(&guild_id).unwrap().notifications = Some(channel_id);
+                let result = shared.conf.with_config_mut(|conf| {
+                    conf.guild_data.get_mut(&shared.guild).unwrap().notifications = channel_id;
                 });
 
                 match result {
@@ -376,22 +381,7 @@ impl AllCommands {
                         result_menu(&null_menu, true, "Internal error. This is a bug!").await.interaction()
                     }
                 }
-            },
-            AllCommands::ForgetMe => {
-                let channel_id = interaction.channel_id;
-
-                let result = conf.with_config_mut(|conf| {
-                    conf.guild_data.get_mut(&guild_id).unwrap().notifications = None;
-                });
-
-                match result {
-                    Ok(_) => result_menu(&null_menu, true, "Success!").await.interaction(),
-                    Err(error) => {
-                        dispatch_debug(error);
-                        result_menu(&null_menu, true, "Internal error. This is a bug!").await.interaction()
-                    }
-                }
-            },
+            }
             AllCommands::Test => {
                 let id = interaction.id;
                 CreateInteractionResponseMessage::new()
@@ -437,13 +427,13 @@ impl AllCommands {
                 )*/
             }
             AllCommands::DebugEndPoll { server, mod_id } => {
-                let (channel, msg) = conf.with_config(|conf| {
-                    let ref poll = conf.guild_data[&guild_id].mod_polls[&ModKey::new(server, mod_id)];
+                let (channel, msg) = shared.conf.with_config(|conf| {
+                    let ref poll = conf.guild_data[&shared.guild].polls[&PollKey::mod_op(server, mod_id)];
                     (poll.channel, poll.poll)
                 });
                 
-                let message = channel.message(&http, msg).await.unwrap();
-                let _ = message.end_poll(&http).await;
+                let message = channel.message(shared, msg).await.unwrap();
+                let _ = message.end_poll(shared.http()).await;
                 
                 info_menu("Ok").interaction()
             }
@@ -451,8 +441,7 @@ impl AllCommands {
     }
 }
 
-static MENUS: Lazy<Mutex<HashMap<u128, MenuHistory>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-static PAGES: Lazy<Mutex<HashMap<u128, MenuUrl>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static MENUS: Lazy<std::sync::Mutex<HashMap<u128, MenuHistory>>> = Lazy::new(|| std::sync::Mutex::new(HashMap::new()));
 
 fn allocate_menu(menu: MenuHistory) -> u128 {
     let mut lock = MENUS.lock().unwrap();
@@ -467,34 +456,9 @@ fn allocate_menu(menu: MenuHistory) -> u128 {
     id
 }
 
-fn deallocate_menu(id: u128) {
-    let mut lock = MENUS.lock().unwrap();
-    lock.remove(&id);
-}
-
 fn get_menu(id: u128) -> Option<MenuHistory> {
     let lock = MENUS.lock().unwrap();
     lock.get(&id).cloned()
-}
-
-fn allocate_page(page: MenuUrl) -> u128 {
-    let mut lock = PAGES.lock().unwrap();
-    let mut rng = thread_rng();
-    loop {
-        let random = rng.gen::<u128>();
-        if !lock.contains_key(&random) {
-            lock.insert(random, page);
-            break random;
-        }
-    }
-}
-
-fn deallocate_page(id: u128) {
-    PAGES.lock().unwrap().remove(&id);
-}
-
-fn get_page(id: u128) -> Option<MenuUrl> {
-    PAGES.lock().unwrap().get(&id).cloned()
 }
 
 #[derive(Encode, Decode, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Display)]
@@ -575,12 +539,12 @@ impl MenuHistory {
     }
 
     pub fn to_id(&self) -> String {
-        let equal = {
+        {
             let lock = MENUS.lock().unwrap();
-            if let Some(id) = lock.iter().find(|(id, menu)| *menu == self).map(|(id, _)| id) {
+            if let Some(id) = lock.iter().find(|(_, menu)| *menu == self).map(|(id, _)| id) {
                 return id.to_string();
             }
-        };
+        }
         let id = allocate_menu(self.clone());
         id.to_string()
     }
@@ -662,8 +626,8 @@ fn server_selection(history: &MenuHistory, statuses: &[ServerStatus], url: &str,
     (fields, buttons)
 }
 
-async fn dashboard_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: GuildId) -> ProcessedMenu {
-    match send_command(conf, guild_id, NetCommand::ListServers) {
+async fn dashboard_menu(shared: &SharedMin, history: &MenuHistory) -> ProcessedMenu {
+    match send_command(shared, NetCommand::ListServers) {
         Ok(Response::List(statuses)) => {
             let (fields, buttons) = server_selection(history, &statuses, "menu", MenuUrlKind::Page, &[]);
 
@@ -677,8 +641,8 @@ async fn dashboard_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: G
     }
 }
 
-async fn server_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: GuildId, server: &str) -> ProcessedMenu {
-    match send_command(conf, guild_id, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Status)) {
+async fn server_menu(shared: &SharedMin, history: &MenuHistory, server: &str) -> ProcessedMenu {
+    match send_command(shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Status)) {
         Ok(Response::Status(status)) => {
             let mut buttons: Vec<CreateButton> = Vec::with_capacity(10);
             match status.status {
@@ -744,8 +708,8 @@ async fn server_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: Guil
     }
 }
 
-async fn mod_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: GuildId, server: &str, page: u64) -> ProcessedMenu {
-    match send_command(conf, guild_id, NetCommand::ServerCommand(server.to_owned(), ServerCommand::ListMods(10, page))) {
+async fn mod_menu(shared: &SharedMin, history: &MenuHistory, server: &str, page: u64) -> ProcessedMenu {
+    match send_command(shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::ListMods(10, page))) {
         Ok(Response::Mods(mods, finished)) => {
             let mut buttons: Vec<CreateButton> = Vec::new();
             let mut fields: Vec<(String, String, bool)> = Vec::new();
@@ -782,14 +746,16 @@ async fn mod_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: GuildId
     }
 }
 
-async fn single_mod_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: GuildId, server: &str, mod_id: &str) -> (ProcessedMenu, Option<Vec<u8>>) {
-    match send_command(conf, guild_id, NetCommand::ServerCommand(server.to_owned(), ServerCommand::QueryMod(mod_id.to_owned()))) {
+async fn single_mod_menu(shared: &SharedMin, history: &MenuHistory, server: &str, mod_id: &str) -> (ProcessedMenu, Option<Vec<u8>>) {
+    match send_command(shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::QueryMod(mod_id.to_owned()))) {
         Ok(Response::Mod(modd)) => {
             let mut buttons = Vec::new();
             let action = MenuUrl::action("uninstall", &[server, mod_id]);
             let action = history.enter_page(action);
 
-            buttons.push(CreateButton::new(action.to_id()).label("Uninstall").emoji('🗑').style(ButtonStyle::Danger));
+            if !reserved_mod_id(mod_id) {
+                buttons.push(CreateButton::new(action.to_id()).label("Uninstall").emoji('🗑').style(ButtonStyle::Danger));
+            }
 
             let menu = Menu::from_embed(mod_embed(&modd)).buttons(buttons);
 
@@ -839,8 +805,8 @@ async fn wtf_bad_bot(history: &MenuHistory) -> ProcessedMenu {
         .build(history, false, false)
 }
 
-async fn install_mod_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id: GuildId, channel_id: &str, message_id: &str) -> ProcessedMenu {
-    match send_command(conf, guild_id, NetCommand::ListServers) {
+async fn install_mod_menu(shared: &SharedMin, history: &MenuHistory, channel_id: &str, message_id: &str) -> ProcessedMenu {
+    match send_command(shared, NetCommand::ListServers) {
         Ok(Response::List(statuses)) => {
             let (fields, buttons) = server_selection(history, &statuses, "install", MenuUrlKind::Action, &[channel_id, message_id]);
 
@@ -855,13 +821,12 @@ async fn install_mod_menu(history: &MenuHistory, conf: &Config<MCAYB>, guild_id:
 }
 
 struct Handler {
-    conf: Config<MCAYB>,
-    guild: GuildId
+    shared: Arc<SharedMin>
 }
 
 impl Handler {
-    pub fn new(conf: Config<MCAYB>, guild: GuildId) -> Self {
-        Self { conf, guild }
+    pub fn new(shared: Arc<SharedMin>) -> Self {
+        Self { shared }
     }
 }
 
@@ -869,27 +834,25 @@ impl Handler {
 impl EventHandler for Handler {
     async fn message_delete(&self, ctx: Context, channel_id: ChannelId, deleted_message_id: MessageId, guild_id: Option<GuildId>) {
         let Some(guild_id) = guild_id else { return };
-        if guild_id != self.guild {
+        if guild_id != self.shared.guild {
             return;
         }
 
-        poll_deleted(&ctx, &self.conf, guild_id, channel_id, deleted_message_id).await;
+        poll_deleted(&self.shared.to_full(ctx.http), channel_id, deleted_message_id).await;
     }
 
     async fn poll_vote_add(&self, ctx: Context, event: MessagePollVoteAddEvent) {
         let Some(guild_id) = event.guild_id else { return };
-        if guild_id != self.guild {
+        if guild_id != self.shared.guild {
             return;
         }
 
-        check_poll(&ctx, &self.conf, self.guild, event.channel_id, event.message_id).await;
+        check_poll(&self.shared.to_full(ctx.http), event.channel_id, event.message_id).await;
     }
 
     async fn message(&self, ctx: Context, new_message: Message) {
-        use anyhow::Context;
-        use core::borrow::Borrow;
         let Some(guild_id) = new_message.guild_id else { return };
-        if guild_id != self.guild {
+        if guild_id != self.shared.guild {
             return;
         }
 
@@ -900,7 +863,7 @@ impl EventHandler for Handler {
             let Some(reference_msg) = reference.message_id &&
             let Ok(the_poll) = reference.channel_id.message(&ctx, reference_msg).await
         {
-            check_poll(&ctx, &self.conf, guild_id, the_poll.channel_id, the_poll.id).await;
+            check_poll(&self.shared.to_full(ctx.http.clone()), the_poll.channel_id, the_poll.id).await;
         }
 
         if new_message.author.bot {
@@ -938,9 +901,8 @@ impl EventHandler for Handler {
 
             let history = MenuHistory::new("install");
             let msg = install_mod_menu(
+                &self.shared,
                 &history,
-                &self.conf,
-                self.guild,
                 &channel_id,
                 &message_id
             ).await;
@@ -992,7 +954,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
             _ => return,
         };
         let Some(guild_id) = guild_id else { return };
-        if guild_id != self.guild {
+        if guild_id != self.shared.guild {
             return;
         }
 
@@ -1004,13 +966,13 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
             Interaction::Command(command) => {
                 let command_data = AllCommands::from_command_data(&command.data).unwrap();
                 let resp = command
-                    .create_response(&ctx.http, CreateInteractionResponse::Message(command_data.run(&ctx.http(), &self.conf, &command, self.guild).await))
+                    .create_response(&ctx.http, CreateInteractionResponse::Message(command_data.run(&self.shared.to_full(ctx.http.clone()), &command).await))
                     .await;
                 if let Err(err) = resp {
                     dispatch_debug(err);
                 }
             }
-            Interaction::Component(mut comp) => {
+            Interaction::Component(comp) => {
                 let id = &comp.data.custom_id;
                 let h = MenuHistory::from_id(id);
 
@@ -1018,27 +980,27 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                     MenuUrlKind::Page => {
                         match &h.current.url as &str {
                             "dashboard" => {
-                                CreateInteractionResponse::UpdateMessage(dashboard_menu(&h, &self.conf, self.guild).await.interaction())
+                                CreateInteractionResponse::UpdateMessage(dashboard_menu(&self.shared, &h).await.interaction())
                             }
                             "menu" => {
                                 let server = &h.current.arguments[0];
-                                CreateInteractionResponse::UpdateMessage(server_menu(&h, &self.conf, self.guild, server).await.interaction())
+                                CreateInteractionResponse::UpdateMessage(server_menu(&self.shared, &h, server).await.interaction())
                             }
                             "install" => {
                                 let channel_id = &h.current.arguments[0];
                                 let message_id = &h.current.arguments[0];
-                                CreateInteractionResponse::UpdateMessage(install_mod_menu(&h, &self.conf, self.guild, channel_id, message_id).await.interaction())
+                                CreateInteractionResponse::UpdateMessage(install_mod_menu(&self.shared, &h, channel_id, message_id).await.interaction())
                             }
                             "mods" => {
                                 let server = &h.current.arguments[0];
                                 let page = &h.current.arguments[1];
                                 let page = u64::from_str(page).unwrap();
-                                CreateInteractionResponse::UpdateMessage(mod_menu(&h, &self.conf, self.guild, server, page).await.interaction())
+                                CreateInteractionResponse::UpdateMessage(mod_menu(&self.shared, &h, server, page).await.interaction())
                             }
                             "mod" => {
                                 let server = &h.current.arguments[0];
                                 let mod_id = &h.current.arguments[1];
-                                let (menu, att) = single_mod_menu(&h, &self.conf, self.guild, server, mod_id).await;
+                                let (menu, att) = single_mod_menu(&self.shared, &h, server, mod_id).await;
                                 let mut msg = menu.interaction();
                                 if let Some(att) = att {
                                     msg = msg.files([CreateAttachment::bytes(att, "logo.png")]);
@@ -1058,7 +1020,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                             "start" => {
                                 let server = &h.current.arguments[0];
                                 CreateInteractionResponse::UpdateMessage(
-                                    match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Start)) {
+                                    match send_command(&self.shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Start)) {
                                         Ok(Response::Ok) => result_menu(&h, true, "Server started!").await.interaction(),
                                         Ok(any) => send_unknown(&h, &any).await.interaction(),
                                         Err(any) => send_err(&h, &any).await.interaction(),
@@ -1067,7 +1029,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                             "stop" => {
                                 let server = &h.current.arguments[0];
                                 CreateInteractionResponse::UpdateMessage(
-                                    match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Stop)) {
+                                    match send_command(&self.shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Stop)) {
                                         Ok(Response::Ok) => result_menu(&h, true, "Server stopped.").await.interaction(),
                                         Ok(any) => send_unknown(&h, &any).await.interaction(),
                                         Err(any) => send_err(&h, &any).await.interaction(),
@@ -1076,7 +1038,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                             "reboot" => {
                                 let server = &h.current.arguments[0];
                                 CreateInteractionResponse::UpdateMessage(
-                                    match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Reboot)) {
+                                    match send_command(&self.shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Reboot)) {
                                         Ok(Response::Ok) => result_menu(&h, true, "Server is rebooting!").await.interaction(),
                                         Ok(any) => send_unknown(&h, &any).await.interaction(),
                                         Err(any) => send_err(&h, &any).await.interaction(),
@@ -1137,16 +1099,15 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
 
                                 match get_msg {
                                     Ok(msg) if msg.attachments.len() == 1 => {
-                                        let mod_install = ModInstalling::Idle(IdleMod {
+                                        let data = IdleMod {
                                             server: server.clone(),
                                             att_name: msg.attachments[0].filename.clone(),
                                             url: msg.attachments[0].url.clone().parse().unwrap(),
-                                        });
+                                        };
 
-                                        let slot = mods_allocate(self.guild, mod_install);
-                                        let guild = self.guild;
+                                        let shared = Arc::new(self.shared.to_full(ctx.http.clone()));
                                         
-                                        tokio::spawn(async move { process_mods::mod_thread(guild, slot).await });
+                                        tokio::spawn(async move { process_mods::mod_thread(shared, data).await });
                                     }
                                     _ => {
                                         let msg1 = channel_id.send_message(&ctx, CreateMessage::new().content("You changed the message while i was processing it"));
@@ -1161,10 +1122,19 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                                 let server = &h.current.arguments[0];
                                 let mod_id = &h.current.arguments[1];
 
-                                match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.clone(), ServerCommand::QueryMod(mod_id.clone()))) {
+                                match send_command(&self.shared, NetCommand::ServerCommand(server.clone(), ServerCommand::QueryMod(mod_id.clone()))) {
                                     Ok(Response::Mod(info)) => {
-                                        let channel = self.conf.with_config(|conf| conf.guild_data[&self.guild].notifications);
-                                        create_poll(ctx.http(), &self.conf, channel.unwrap_or(comp.channel_id), None, server, &info, self.guild, PollKind::Remove).await;
+                                        let key = PollKey::Mod {
+                                            server: server.clone(),
+                                            mod_id: info.mod_id.clone(),
+                                        };
+                                        
+                                        let kind = PollKind::Remove {
+                                            server: server.clone(),
+                                            info,
+                                        };
+                                        
+                                        create_poll(&self.shared.to_full(ctx.http.clone()), key, kind).await;
 
                                         CreateInteractionResponse::Acknowledge
                                     }
@@ -1175,7 +1145,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                             "zip" => {
                                 let server = &h.current.arguments[0];
 
-                                match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.clone(), ServerCommand::GenerateModsZip)) {
+                                match send_command(&self.shared, NetCommand::ServerCommand(server.clone(), ServerCommand::GenerateModsZip)) {
                                     Ok(Response::Ok) => {
                                         CreateInteractionResponse::UpdateMessage(result_menu(&h, true, "Mods zip file is generating!").await.interaction())
                                     }
@@ -1218,7 +1188,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                                 let command = text.value.as_ref().unwrap();
 
                                 CreateInteractionResponse::UpdateMessage(
-                                    match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Console(command.clone()))) {
+                                    match send_command(&self.shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::Console(command.clone()))) {
                                         Ok(Response::CommandOutput(output)) => result_menu(&h, true, &output).await.interaction(),
                                         Ok(Response::UnknownServer) => unknown_server(&h, &server).await.interaction(),
                                         Ok(any) => send_unknown(&h, &any).await.interaction(),
@@ -1239,7 +1209,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                                         confirm2.eq_ignore_ascii_case(CONFIRM_BACKUP) &&
                                         confirm3 == server
                                     {
-                                        match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.clone(), ServerCommand::Backup)) {
+                                        match send_command(&self.shared, NetCommand::ServerCommand(server.clone(), ServerCommand::Backup)) {
                                             Ok(Response::Ok) => result_menu(&h, true, "Backing up!").await.interaction(),
                                             Ok(Response::UnknownServer) => unknown_server(&h, &server).await.interaction(),
                                             Ok(any) => send_unknown(&h, &any).await.interaction(),
@@ -1264,7 +1234,7 @@ In Minecraft, players explore a blocky, pixelated, procedurally generated, three
                                         confirm2.eq_ignore_ascii_case(CONFIRM_RESTORE) &&
                                         confirm3 == server
                                     {
-                                        match send_command(&self.conf, self.guild, NetCommand::ServerCommand(server.clone(), ServerCommand::Restore)) {
+                                        match send_command(&self.shared, NetCommand::ServerCommand(server.clone(), ServerCommand::Restore)) {
                                             Ok(Response::Ok) => result_menu(&h, true, "Restoring backup!").await.interaction(),
                                             Ok(Response::UnknownServer) => unknown_server(&h, &server).await.interaction(),
                                             Ok(Response::NoBackup) => result_menu(&h, false, "No backup exists!").await.interaction(),
@@ -1416,27 +1386,82 @@ impl core::fmt::Display for Event {
     }
 }
 
-static MSGS: Lazy<Mutex<Notifs>> = Lazy::new(|| Mutex::new(Notifs::new(&["backup", "restore", "install_mod", "uninstall_mod", "zip"])));
-pub static MODS: Lazy<Mutex<HashMap<GuildId, AllocVec<ModInstalling>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-
-pub fn mods_allocate(guild: GuildId, modd: ModInstalling) -> usize {
-    let mut mods = MODS.lock().unwrap();
-    if !mods.contains_key(&guild) {
-        mods.insert(guild, AllocVec::new());
-    }
-    
-    mods.get_mut(&guild).unwrap().allocate(modd)
+pub struct SharedMin {
+    pub conf: Config<MCAYB>,
+    pub guild: GuildId,
+    pub msgs: Mutex<Notifs>,
+    pub mods: Mutex<AllocVec<ModInstalling>>,
+    pub last_status: Mutex<Vec<ServerStatus>>,
 }
 
-pub fn mods_with<F, R>(guild: GuildId, f: F) -> R
-where F: FnOnce(MutexGuard<HashMap<GuildId, AllocVec<ModInstalling>>>) -> R
-{
-    let mut mods = MODS.lock().unwrap();
-    if !mods.contains_key(&guild) {
-        mods.insert(guild, AllocVec::new());
+impl SharedMin {
+    pub fn new(conf: Config<MCAYB>, guild: GuildId) -> Self {
+        Self {
+            conf: conf.clone(),
+            guild,
+            msgs: Mutex::new(Notifs::new(&["backup", "restore", "install_mod", "uninstall_mod", "zip"])),
+            mods: Mutex::new(AllocVec::new()),
+            last_status: Mutex::new(conf.with_config(|conf| conf.guild_data[&guild].last_status.clone())),
+        }
+    }
+    
+    pub fn to_full(self: &Arc<Self>, http: Arc<Http>) -> Shared {
+        let this = self.clone();
+        Shared {
+            __composite: this,
+            http,
+        }
     }
 
-    f(mods)
+    pub async fn mods_allocate(&self, modd: ModInstalling) -> usize {
+        self.mods.lock().await.allocate(modd)
+    }
+
+    pub async fn mods_with<F, R>(&self, f: F) -> R
+    where F: FnOnce(MutexGuard<AllocVec<ModInstalling>>) -> R
+    {
+        let mods = self.mods.lock().await;
+        f(mods)
+    }
+    
+    pub async fn mods_get(&self, slot: usize) -> ModInstalling {
+        self.mods.lock().await[slot].clone()
+    }
+    
+    pub async fn mods_set(&self, slot: usize, modd: ModInstalling) {
+        self.mods.lock().await[slot] = modd;
+    }
+}
+
+pub struct Shared {
+    __composite: Arc<SharedMin>,
+    pub http: Arc<Http>
+}
+
+impl Deref for Shared {
+    type Target = SharedMin;
+    fn deref(&self) -> &Self::Target {
+        &self.__composite
+    }
+}
+
+impl Shared {
+    pub fn new(conf: Config<MCAYB>, http: Arc<Http>, guild: GuildId) -> Self {
+        Self {
+            http,
+            __composite: Arc::new(SharedMin::new(conf, guild))
+        }
+    }
+}
+
+impl CacheHttp for Shared {
+    fn http(&self) -> &Http {
+        self.http.http()
+    }
+
+    fn cache(&self) -> Option<&Arc<Cache>> {
+        self.http.cache()
+    }
 }
 
 pub async fn init(conf: Config<MCAYB>) -> Result<()> {
@@ -1445,35 +1470,83 @@ pub async fn init(conf: Config<MCAYB>) -> Result<()> {
     // Log into discord bot
     let intents = GatewayIntents::GUILD_MESSAGES
         | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::DIRECT_MESSAGES
         | GatewayIntents::GUILD_MESSAGE_POLLS
         ;
 
-
-
-    let client = Client::builder(TOKEN, intents);
-    let client = conf.with_config(|config| {
-        let mut client = client;
+    
+    let mut client = Client::builder(TOKEN, intents);
+    let mut shared_map = Vec::new();
+    conf.with_config(|config| {
         for (guild, _) in config.guild_data.iter() {
-            let conf = conf.clone();
-            client = client.event_handler(Handler::new(conf, *guild));
+            let shared = SharedMin::new(conf.clone(), *guild);
+            shared_map.push(Arc::new(shared));
         }
-        client
     });
+    
+    for shared in shared_map.iter() {
+        client = client.event_handler(Handler::new(shared.clone()));
+    }
 
     let mut client = client.await
         .context("Failed to log into discord bot")?;
-
-
+    
     let http = client.http.clone();
-
-    let handle = tokio::spawn(async move {
+    
+    let _handle = tokio::spawn(async move {
         if let Err(err) = client.start().await {
             dispatch_debug(&err);
         };
     });
 
-    account_thread(http, conf).await;
+    let data = conf.with_config(|conf| {
+        conf.guild_data.clone()
+    });
+
+    let mut shared_map: Vec<Arc<Shared>> = shared_map
+        .iter()
+        .map(|min| min.to_full(http.clone()))
+        .map(|full| Arc::new(full))
+        .collect();
+    
+    // Check for deleted polls and polls that have already ended
+    for (guild, data) in data.iter() {
+        let shared = shared_map.iter().find(|shared| shared.guild == *guild).unwrap();
+        for (_, poll) in data.polls.iter() {
+            if !poll_deleted(&shared, poll.channel, poll.poll).await {
+                check_poll(&shared, poll.channel, poll.poll).await;
+            }
+        }
+    }
+
+    // Check if this is a new version
+    let old_version = conf.with_config_mut(|conf| {
+        let version = replace(&mut conf.version, VERSION);
+        version != VERSION
+    }).expect("Failed to update version in config");
+
+    if old_version {
+        for (i, data) in data.values().enumerate() {
+            let channel = data.notifications;
+            let title = format!("Bot updated to `{VERSION}`!");
+            let msg = Menu::new((28, 201, 121), title, Some(include_str!("../changelog.md").to_owned()))
+                .footer(&VERSION.to_string())
+                .build(&MenuHistory::new("null"), false, false)
+                .message();
+
+            let _ = channel.send_message(&shared_map[i], msg).await;
+        }
+    }
+    
+    let set = LocalSet::new();
+    set.run_until(async {
+        for shared in shared_map {
+            let _handle = spawn_local(async move { account_thread(shared).await });
+        }
+        
+        loop {
+            yield_now().await;
+        }
+    }).await;
     
     // let set = LocalSet::new();
     // set.run_until(async move {
@@ -1495,66 +1568,26 @@ pub async fn init(conf: Config<MCAYB>) -> Result<()> {
     Ok(())
 }
 
-async fn account_thread(http: Arc<Http>, conf: Config<MCAYB>) {
-    let data = conf.with_config(|conf| {
-        conf.guild_data.clone()
-    });
-    
-    let mut guilds = Vec::new();
-
-    // Check for deleted polls and polls that have already ended
-    for (guild, data) in data.iter() {
-        guilds.push(*guild);
-        for (_, poll) in data.mod_polls.iter() {
-            if !poll_deleted(&http, &conf, *guild, poll.channel, poll.poll).await {
-                check_poll(&http, &conf, *guild, poll.channel, poll.poll).await;
-            }
-        }
-    }
-    
-    // Check if this is a new version
-    let old_version = conf.with_config_mut(|conf| {
-        let version = replace(&mut conf.version, VERSION);
-        version != VERSION
-    }).expect("Failed to update version in config");
-
-    if old_version {
-        for data in data.values() {
-            if let Some(channel) = data.notifications {
-                let title = format!("Bot updated to `{VERSION}`!");
-                let msg = Menu::new((28, 201, 121), title, Some(include_str!("../changelog.md").to_owned()))
-                    .footer(&VERSION.to_string())
-                    .build(&MenuHistory::new("null"), false, false)
-                    .message();
-                
-                let _ = channel.send_message(&http, msg).await;
-            }
-        }
-    }
-    
-    let mut last_status: HashMap<GuildId, Vec<ServerStatus>> = conf.with_config(|x| x.guild_data.iter().map(|(id, data)| (*id, data.last_status.clone())).collect());
+async fn account_thread(shared: Arc<Shared>) {
     let mut last = SystemTime::now();
-    
     loop {
         let now = SystemTime::now();
         if now.duration_since(last).unwrap() > Duration::from_secs(1) {
-            for guild in guilds.iter() {
-                let last_status = last_status.get_mut(guild).unwrap();
-                guild_loop(*guild, &http, &conf, &mut last, last_status).await;
-            }
+            last = now;
+            guild_loop(&shared).await;
         }
     }
 }
 
-async fn guild_loop(guild: GuildId, http: &Http, conf: &Config<MCAYB>, last: &mut SystemTime, last_status: &mut Vec<ServerStatus>) {
-    let mut notif_channel = conf.with_config(|config| {
-        config.guild_data[&guild].notifications
+async fn guild_loop(shared: &Shared) {
+    let notif_channel = shared.conf.with_config(|config| {
+        config.guild_data[&shared.guild].notifications
     });
-    let Some(notif_channel) = notif_channel else { return };
-    let mut msgs = MSGS.lock().unwrap();
 
     // Detect notifications the server can't give us
-    match send_command(&conf, guild, NetCommand::ListServers) {
+    let mut msgs = shared.msgs.lock().await;
+    let mut last_status = { shared.last_status.lock().await.clone() };
+    match send_command(shared, NetCommand::ListServers) {
         Ok(Response::List(new_status)) => {
             let mut events = Vec::new();
 
@@ -1574,10 +1607,10 @@ async fn guild_loop(guild: GuildId, http: &Http, conf: &Config<MCAYB>, last: &mu
                 }
             }
 
-            if new_status != *last_status {
-                *last_status = new_status.clone();
-                let _ = conf.with_config_mut(|conf| {
-                    conf.guild_data.get_mut(&guild).unwrap().last_status = new_status;
+            if new_status != last_status {
+                last_status = new_status.clone();
+                let _ = shared.conf.with_config_mut(|conf| {
+                    conf.guild_data.get_mut(&shared.guild).unwrap().last_status = new_status;
                 });
             }
 
@@ -1585,38 +1618,38 @@ async fn guild_loop(guild: GuildId, http: &Http, conf: &Config<MCAYB>, last: &mu
             for event in events {
                 let msg = info_menu(&event.to_string()).message();
 
-                let _ = notif_channel.send_message(&http, msg).await;
+                let _ = notif_channel.send_message(shared, msg).await;
             }
         }
         _ => {}
     }
 
     // Receive normal notifications
-    match send_command(&conf, guild, NetCommand::Notifications) {
+    match send_command(shared, NetCommand::Notifications) {
         Ok(Response::Notifications(notifs)) => {
             for notif in notifs {
                 match &notif {
                     Notification::BackupProgress(server, _, _) => {
-                        msgs.get("restore").get(server).send_msg(&http, notif_channel, notif.to_string()).await;
+                        msgs.get("restore").get(server).send_msg(shared, notif_channel, notif.to_string()).await;
                     }
                     Notification::RestoreProgress(server, _, _) => {
-                        msgs.get("backup").get(server).send_msg(&http, notif_channel, notif.to_string()).await;
+                        msgs.get("backup").get(server).send_msg(shared, notif_channel, notif.to_string()).await;
                     }
                     Notification::ZipProgress(server, _) => {
-                        msgs.get("zip").get(server).send_msg(&http, notif_channel, notif.to_string()).await;
+                        msgs.get("zip").get(server).send_msg(shared, notif_channel, notif.to_string()).await;
                     }
                     Notification::ZipFailed(server, _) => {
-                        msgs.get("zip").get(server).send_msg(&http, notif_channel, notif.to_string()).await;
+                        msgs.get("zip").get(server).send_msg(shared, notif_channel, notif.to_string()).await;
                         msgs.get("zip").get(server).clear();
                     }
                     Notification::ZipFile(server, _) => {
-                        msgs.get("zip").get(server).send_msg(&http, notif_channel, notif.to_string()).await;
+                        msgs.get("zip").get(server).send_msg(shared, notif_channel, notif.to_string()).await;
                         msgs.get("zip").get(server).clear();
                     }
                     notif => {
                         let msg = info_menu(&notif.to_string()).message();
 
-                        let _ = notif_channel.send_message(&http, msg).await;
+                        let _ = notif_channel.send_message(shared, msg).await;
                     }
                 }
 
@@ -1634,11 +1667,7 @@ async fn guild_loop(guild: GuildId, http: &Http, conf: &Config<MCAYB>, last: &mu
         _ => {}
     }
 
-    let mut mods = MODS.lock().unwrap();
-    if !mods.contains_key(&guild) {
-        mods.insert(guild, AllocVec::new());
-    }
-    let mods = mods.get_mut(&guild).unwrap();
+    let mut mods = shared.mods.lock().await;
     if mods.is_empty() {
         msgs.get("install_mod").servers.clear();
     }
@@ -1648,21 +1677,32 @@ async fn guild_loop(guild: GuildId, http: &Http, conf: &Config<MCAYB>, last: &mu
         match modd {
             ModInstalling::Idle(IdleMod { server, att_name, .. }) => {
                 let data = format!(r#""{}" sent for downloading  "#, escape_discord(att_name));
-                msgs.get("install_mod").get(server).send_msg(&http, notif_channel, data.clone()).await;
+                msgs.get("install_mod").get(server).send_msg(shared, notif_channel, data.clone()).await;
             }
             ModInstalling::Downloaded(DownloadedMod { server, att_name, .. }) => {
                 let data = format!(r#"Downloaded "{}""#, escape_discord(att_name));
-                msgs.get("install_mod").get(server).send_msg(&http, notif_channel, data.clone()).await;
+                msgs.get("install_mod").get(server).send_msg(shared, notif_channel, data.clone()).await;
             }
             ModInstalling::Processed(processed) => {
                 to_remove.push(idx);
+                msgs.get("install_mod").get(&processed.server).delete_msg(shared, notif_channel).await;
 
-                create_poll(&http, &conf, notif_channel, Some(&mut msgs), &processed.server, &processed.info, guild, PollKind::Install).await;
+                let key = PollKey::Mod {
+                    server: processed.server.clone(),
+                    mod_id: processed.info.mod_id.clone()
+                };
+                
+                let kind = PollKind::Install {
+                    server: processed.server.clone(),
+                    info: processed.info.clone(),
+                };
+                
+                create_poll(shared, key, kind).await;
             }
             ModInstalling::FuckedUp(FuckedUpMod { server, att_name, err }) => {
                 to_remove.push(idx);
                 let data = format!(r#"Error processing mod "{}": {err:?}"#, escape_discord(att_name));
-                msgs.get("install_mod").get(server).send_msg(&http, notif_channel, data.clone()).await;
+                msgs.get("install_mod").get(server).send_msg(shared, notif_channel, data.clone()).await;
             }
         }
     }
@@ -1672,52 +1712,58 @@ async fn guild_loop(guild: GuildId, http: &Http, conf: &Config<MCAYB>, last: &mu
     }
 }
 
-async fn create_poll(http: &Http, conf: &Config<MCAYB>, channel: ChannelId, msgs: Option<&mut Notifs>, server: &str, info: &ModInfo, guild: GuildId, kind: PollKind) {
+async fn create_poll(shared: &Shared, key: PollKey, kind: PollKind) {
     use anyhow::Context;
 
-    let mod_name = info.name.clone().unwrap_or(info.mod_id.clone());
-
     // Failure conditions
-    let key = ModKey::new(server, &info.mod_id);
-    let existing_poll = conf.with_config(|config| {
-        config.guild_data[&guild].mod_polls.get(&key).cloned()
+    let existing_poll = shared.conf.with_config(|config| {
+        config.guild_data[&shared.guild].polls.get(&key).cloned()
     });
+    let channel = shared.conf.with_config(|conf| conf.guild_data[&shared.guild].notifications);
     
     // Poll for this mod and server already exists
 
     // Edge case where the poll has been deleted:
     // The second check will fail, and the poll will be overwritten in the config
-    if let Some(poll) = existing_poll && let Ok(the_poll) = http.get_message(poll.channel, poll.poll).await {
+    if let Some(poll) = existing_poll && let Ok(the_poll) = shared.http().get_message(poll.channel, poll.poll).await {
+        let description = match &poll.kind {
+            PollKind::Install { info, server, .. } |
+            PollKind::Remove { info, server, .. } => {
+                format!(r#"A poll involving "{}" in "{}" has already been made!"#, escape_discord(info.name()), escape_discord(server))
+            }
+            PollKind::Restore { server, .. } => {
+                format!(r#"A poll involving server "{}" has already been made!"#, escape_discord(server))
+            }
+        };
+        
         let menu = Menu::new(
             (196, 196, 116),
             "Poll ongoing!".to_owned(),
-            Some(format!(r#"A poll involving "{}" in "{}" has already been made!"#, escape_discord(&info.mod_id), escape_discord(server)))
+            Some(description)
         );
 
         let msg = menu.build(&MenuHistory::new("already_polled"), false, false);
         let msg = msg.message().reference_message(&the_poll);
-
-        let _ = channel.send_message(&http, msg).await;
+        
+        let _ = channel.send_message(shared, msg).await;
         return;
     }
 
     let mut del = None;
 
-    match kind {
-        PollKind::Install => {
+    match &kind {
+        PollKind::Install { server, info, .. } => {
             del = Some(DelOnDrop::new(&info.path));
-
-            msgs.unwrap().get("install_mod").get(server).delete_msg(&http, channel).await;
 
             // What if the mod is already installed?
             let null_history = MenuHistory::new("null");
-            let error_msg = match send_command(conf, guild, NetCommand::ServerCommand(server.to_owned(), ServerCommand::ListMods(0, 0))) {
+            let error_msg = match send_command(shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::ListMods(0, 0))) {
                 Ok(Response::Mods(mods, _)) => {
                     if mods.iter().any(|modd| &modd.mod_id == &info.mod_id) {
                         // Some(already_installed(&key.mod_id, &key.server).message())
                         // Update the mod instead
 
-                        match send_command(conf, guild, NetCommand::ServerCommand(server.to_owned(), ServerCommand::UpdateMod(info.path.to_string_lossy().to_string(), info.filename.clone()))) {
+                        match send_command(shared, NetCommand::ServerCommand(server.to_owned(), ServerCommand::UpdateMod(info.path.to_string_lossy().to_string(), info.filename.clone()))) {
                             Ok(Response::Ok) => {
                                 Some(info_menu(&format!(r#"Mod "{}" updated for "{}"!"#, escape_discord(&info.mod_id), escape_discord(server))).message())
                             }
@@ -1733,21 +1779,36 @@ async fn create_poll(http: &Http, conf: &Config<MCAYB>, channel: ChannelId, msgs
                 Err(any) => Some(send_err(&null_history, &any).await.message()),
             };
             if let Some(msg) = error_msg {
-                let _ = channel.send_message(&http, msg).await;
+                let _ = channel.send_message(shared, msg).await;
                 return;
             }
         }
-        PollKind::Remove => {
+        _ => {
         }
     }
-
-    let msg = CreateMessage::new().embed(mod_embed(info));
-    let poll_title = match kind {
-        PollKind::Install => {
-            format!(r#"Install "{mod_name}" to "{server}"?"#)
+    
+    match &kind {
+        PollKind::Install { info, .. } |
+        PollKind::Remove { info, .. } => {
+            let mut msg = CreateMessage::new().embed(mod_embed(info));
+            if let Some(logo) = &info.logo {
+                msg = msg.files([CreateAttachment::bytes(logo.clone(), "logo.png")])
+            };
+            let _ = channel.send_message(shared, msg).await;
         }
-        PollKind::Remove => {
-            format!(r#"Remove "{mod_name}" from "{server}"?"#)
+        _ => {}
+    };
+
+    
+    let poll_title = match &kind {
+        PollKind::Install { server, info, .. } => {
+            format!(r#"Install "{}" to "{server}"?"#, info.name())
+        }
+        PollKind::Remove { server, info, .. } => {
+            format!(r#"Remove "{}" from "{server}"?"#, info.name())
+        }
+        PollKind::Restore { server } => {
+            format!(r#"Restore backup for "{server}"?"#)
         }
     };
     let poll = CreateMessage::new().poll(CreatePoll::new()
@@ -1756,27 +1817,20 @@ async fn create_poll(http: &Http, conf: &Config<MCAYB>, channel: ChannelId, msgs
             CreatePollAnswer::new().emoji("👍".to_string()).text("Yes"),
             CreatePollAnswer::new().emoji("👎".to_string()).text("No")
         ].to_vec())
-        .duration(Duration::from_secs(60 * 60))
+        .duration(Duration::from_secs(60 * 60 * 24))
     );
 
     let r: Result<()> = try {
-        if let Some(logo) = &info.logo {
-            channel.send_files(&http, [CreateAttachment::bytes(logo.clone(), "logo.png")].to_vec(), msg.clone()).await.context("Failed to send mod info")?;
-        } else {
-            channel.send_message(&http, msg.clone()).await.context("Failed to send mod info")?;
-        }
-        let poll = channel.send_message(&http, poll.clone()).await.context("Failed to create poll")?;
-        conf.with_config_mut(|config| {
-            let key = ModKey::new(server, &info.mod_id);
-            if config.guild_data[&guild].mod_polls.contains_key(&key) {
+        let poll = channel.send_message(shared, poll.clone()).await.context("Failed to create poll")?;
+        let _ = channel.pin(shared.http(), poll.id).await;
+        shared.conf.with_config_mut(|config| {
+            if config.guild_data[&shared.guild].polls.contains_key(&key) {
                 bail!("Poll created twice for same mod_id and same server")
             }
-            config.guild_data.get_mut(&guild).unwrap().mod_polls.insert(ModKey::new(server, &info.mod_id), ModPoll {
+            config.guild_data.get_mut(&shared.guild).unwrap().polls.insert(key, OngoingPoll {
                 channel,
                 poll: poll.id,
-                file: info.path.clone(),
-                preferred_name: info.filename.clone(),
-                kind
+                kind: kind.clone()
             });
 
             Ok(())
@@ -1786,7 +1840,7 @@ async fn create_poll(http: &Http, conf: &Config<MCAYB>, channel: ChannelId, msgs
     if let Err(err) = r {
         println!("Something went wrong");
         dispatch_debug(&err);
-        let _ = channel.send_message(&http, result_menu(
+        let _ = channel.send_message(shared, result_menu(
             &MenuHistory::new("poll_error"),
             false,
             &format!("Error creating poll: {err}")).await.message()).await;
@@ -1796,10 +1850,10 @@ async fn create_poll(http: &Http, conf: &Config<MCAYB>, channel: ChannelId, msgs
     del.map(|del| del.forgive());
 }
 
-async fn poll_deleted(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, the_channel: ChannelId, deleted_poll: MessageId) -> bool {
-    let (channel, key, poll) = conf.with_config(|conf| {
-        let ref guild_data = conf.guild_data[&guild];
-        for (key, poll) in guild_data.mod_polls.iter() {
+async fn poll_deleted(shared: &Shared, the_channel: ChannelId, deleted_poll: MessageId) -> bool {
+    let (channel, key, poll) = shared.conf.with_config(|conf| {
+        let ref guild_data = conf.guild_data[&shared.guild];
+        for (key, poll) in guild_data.polls.iter() {
             if poll.channel == the_channel && poll.poll == deleted_poll {
                 return (guild_data.notifications, Some(key.clone()), Some(poll.clone()));
             }
@@ -1808,40 +1862,41 @@ async fn poll_deleted(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId
     });
 
     if let Some(key) = key && let Some(poll) = poll {
-        let msg = http.http().get_message(poll.channel, poll.poll).await;
+        let msg = shared.http().get_message(poll.channel, poll.poll).await;
         if msg.is_ok() {
             return false;
         }
 
-        let del = if poll.kind == PollKind::Install {
-            Some(DelOnDrop::new(&poll.file))
+        let _del = if let PollKind::Install { info, .. } = &poll.kind {
+            Some(DelOnDrop::new(&info.path))
         } else { None };
-        let _ = conf.with_config_mut(|conf| {
-            conf.guild_data.get_mut(&guild).unwrap().mod_polls.remove(&key);
+        let _ = shared.conf.with_config_mut(|conf| {
+            conf.guild_data.get_mut(&shared.guild).unwrap().polls.remove(&key);
         });
 
-        if let Some(channel) = channel {
-            let title = match poll.kind {
-                PollKind::Install => {
-                    format!(r#"Cancelled poll to add "{}" to "{}""#, escape_discord(key.mod_id), escape_discord(key.server))
-                }
-                PollKind::Remove => {
-                    format!(r#"Cancelled poll to remove "{}" from "{}""#, escape_discord(key.mod_id), escape_discord(key.server))
-                }
-            };
-            let msg = Menu::new((50, 58, 194), title, None)
-                .build(&MenuHistory::new("poll_deleted"), false, false)
-                .message();
-            let _ = channel.send_message(http, msg).await;
-        }
+        let title = match &poll.kind {
+            PollKind::Install { info, server, .. } => {
+                format!(r#"Cancelled poll to add "{}" to "{}""#, escape_discord(info.name()), escape_discord(server))
+            }
+            PollKind::Remove { info, server, .. } => {
+                format!(r#"Cancelled poll to remove "{}" from "{}""#, escape_discord(info.name()), escape_discord(server))
+            }
+            PollKind::Restore { server, .. } => {
+                format!(r#"Cancelled poll to restore backup for "{}""#, escape_discord(server))
+            }
+        };
+        let msg = Menu::new((50, 58, 194), title, None)
+            .build(&MenuHistory::new("poll_deleted"), false, false)
+            .message();
+        let _ = channel.send_message(shared, msg).await;
     }
     true
 }
 
-async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, the_channel: ChannelId, the_poll: MessageId) {
-    let (channel, key, poll) = conf.with_config(|conf| {
-        let ref guild_data = conf.guild_data[&guild];
-        for (key, poll) in guild_data.mod_polls.iter() {
+async fn check_poll(shared: &Shared, the_channel: ChannelId, the_poll: MessageId) {
+    let (channel, key, poll) = shared.conf.with_config(|conf| {
+        let ref guild_data = conf.guild_data[&shared.guild];
+        for (key, poll) in guild_data.polls.iter() {
             if poll.channel == the_channel && poll.poll == the_poll {
                 return (guild_data.notifications, Some(key.clone()), Some(poll.clone()));
             }
@@ -1850,31 +1905,29 @@ async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, 
     });
 
     if let Some(key) = key && let Some(poll) = poll {
-        async fn funny_message(http: impl CacheHttp, channel: Option<ChannelId>, msg: impl Into<String>) {
-            if let Some(channel) = channel {
-                let msg = CreateMessage::new().content(msg);
-                let _ = channel.send_message(http.http(), msg).await;
-            }
+        async fn funny_message(http: impl CacheHttp, channel: ChannelId, msg: impl Into<String>) {
+            let msg = CreateMessage::new().content(msg);
+            let _ = channel.send_message(http.http(), msg).await;
         }
 
         // Error conditions, error conditions and more error conditions
-        let Ok(poll_message) = poll.channel.message(http.http(), poll.poll).await else {
-            funny_message(&http, channel, "You deleted the poll while i was checking the results WHYYYYYYY :(((").await;
+        let Ok(poll_message) = poll.channel.message(shared.http(), poll.poll).await else {
+            funny_message(shared, channel, "You deleted the poll while i was checking the results WHYYYYYYY :(((").await;
             return
         };
 
         let Some(poll_data) = &poll_message.poll else {
-            funny_message(&http, channel, "The poll message somehow doesn't contain a poll. I don't even know how you got here").await;
+            funny_message(shared, channel, "The poll message somehow doesn't contain a poll. I don't even know how you got here").await;
             return
         };
 
         let Some(results) = &poll_data.results else {
-            funny_message(&http, channel, "Discord API FOR SOME FUCKING REASON didn't include the poll results.").await;
+            funny_message(shared, channel, "Discord API FOR SOME FUCKING REASON didn't include the poll results.").await;
             return
         };
 
         // *What does everyone mean?? for now, it means every member, excluding the bot itself
-        let member_count = guild.members_iter(http.http()).filter(|member| future::ready(
+        let member_count = shared.guild.members_iter(shared.http()).filter(|member| future::ready(
             if let Ok(member) = member && !member.user.bot {
                 true
             } else {
@@ -1889,31 +1942,32 @@ async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, 
         // If everyone* voted, and the poll is not yet finalized, end the poll now
         if !results.is_finalized {
             if vote_count >= min_count {
-                let _ = poll_message.end_poll(http.http()).await;
+                let _ = poll_message.end_poll(shared.http()).await;
             } else {
                 return;
             }
         }
 
         // No going back from here
-        let del = if poll.kind == PollKind::Install {
-            Some(DelOnDrop::new(&poll.file))
+        let _ = the_channel.unpin(shared.http(), the_poll).await;
+        let del = if let PollKind::Install { info, .. } = &poll.kind {
+            Some(DelOnDrop::new(&info.path))
         } else { None };
 
-        let _ = conf.with_config_mut(|conf| {
-            conf.guild_data.get_mut(&guild).unwrap().mod_polls.remove(&key);
+        let _ = shared.conf.with_config_mut(|conf| {
+            conf.guild_data.get_mut(&shared.guild).unwrap().polls.remove(&key);
         });
-        let _ = conf.with_config_mut(|conf| {
-            conf.guild_data.get_mut(&guild).unwrap().mod_polls.remove(&key);
+        let _ = shared.conf.with_config_mut(|conf| {
+            conf.guild_data.get_mut(&shared.guild).unwrap().polls.remove(&key);
         });
 
         let Some(yes_selection) = poll_data.answers.get(0) else {
-            funny_message(&http, channel, "The poll doesn't have any answers how :sob:").await;
+            funny_message(shared, channel, "The poll doesn't have any answers how :sob:").await;
             return
         };
 
         let Some(no_selection) = poll_data.answers.get(1) else {
-            funny_message(&http, channel, "The poll only has one answer this is getting insane").await;
+            funny_message(shared, channel, "The poll only has one answer this is getting insane").await;
             return
         };
 
@@ -1932,71 +1986,79 @@ async fn check_poll(http: impl CacheHttp, conf: &Config<MCAYB>, guild: GuildId, 
         match yes_answer.cmp(&no_answer) {
             Ordering::Greater if vote_count >= min_count => {
                 let null_history = MenuHistory::new("null");
-                match poll.kind {
-                    PollKind::Install => {
-                        let error_msg = match send_command(conf, guild, NetCommand::ServerCommand(key.server.clone(), ServerCommand::InstallMod(poll.file.to_string_lossy().to_string(), poll.preferred_name.clone()))) {
+                match &poll.kind {
+                    PollKind::Install { server, info, .. } => {
+                        let error_msg = match send_command(shared, NetCommand::ServerCommand(server.clone(), ServerCommand::InstallMod(info.path.to_string_lossy().to_string(), info.filename.clone()))) {
                             Ok(Response::Ok) => {
                                 del.map(|del| del.forgive());
                                 None
                             },
                             Ok(Response::ModConflict) => {
-                                Some(already_installed(&key.mod_id, &key.server).message())
+                                Some(already_installed(&info.mod_id, server).message())
                             }
                             Ok(any) => Some(send_unknown(&null_history, &any).await.message()),
                             Err(any) => Some(send_err(&null_history, &any).await.message()),
                         };
 
-                        if let Some(channel) = channel && let Some(msg) = error_msg {
-                            let _ = channel.send_message(&http, msg).await;
+                        if let Some(msg) = error_msg {
+                            let _ = channel.send_message(shared, msg).await;
+                        } else {
+                            reboot_server(shared, server).await;
                         }
                     }
-                    PollKind::Remove => {
-                        let error_msg = match send_command(conf, guild, NetCommand::ServerCommand(key.server.clone(), ServerCommand::UninstallMod(key.mod_id.clone()))) {
+                    PollKind::Remove { server, info, .. } => {
+                        let error_msg = match send_command(shared, NetCommand::ServerCommand(server.clone(), ServerCommand::UninstallMod(info.mod_id.clone()))) {
                             Ok(Response::Ok) => {
                                 None
                             },
-                            Ok(Response::NoSuchMod) => Some(no_such_mod(&key.mod_id, &key.server).message()),
+                            Ok(Response::NoSuchMod) => Some(no_such_mod(&info.mod_id, server).message()),
                             Ok(any) => Some(send_unknown(&null_history, &any).await.message()),
                             Err(any) => Some(send_err(&null_history, &any).await.message()),
                         };
 
-                        if let Some(channel) = channel && let Some(msg) = error_msg {
-                            let _ = channel.send_message(&http, msg).await;
+                        if let Some(msg) = error_msg {
+                            let _ = channel.send_message(shared, msg).await;
+                        } else {
+                            reboot_server(shared, server).await;
                         }
                     }
-                }
-                // REBOOT THE SERVER
-                let msg = match send_command(conf, guild, NetCommand::ServerCommand(key.server.clone(), ServerCommand::Status)) {
-                    Ok(Response::Status(status)) => {
-                        if status.status != Status::Idle {
-                            let _ = send_command(conf, guild, NetCommand::ServerCommand(key.server.clone(), ServerCommand::Reboot));
-                        }
-                        None
-                    }
-                    Ok(any) => Some(send_unknown(&null_history, &any).await.message()),
-                    Err(any) => Some(send_err(&null_history, &any).await.message()),
-                };
-
-                // Notify of errors happened trying to reboot
-                if let Some(channel) = channel && let Some(msg) = msg {
-                    let _ = channel.send_message(&http, msg).await;
+                    PollKind::Restore { .. } => {}
                 }
             }
             Ordering::Greater => {
-                if let Some(channel) = channel {
-                    let members = if vote_count == 1 {
-                        "member"  
-                    } else {
-                        "members"
-                    };
-                    let msg = info_menu(&format!("Poll won, but only {vote_count} {members} voted, expected at least {min_count} votes"))
-                        .message()
-                        .reference_message(&poll_message);
-                    let _ = channel.send_message(&http, msg).await;
-                }
+                let members = if vote_count == 1 {
+                    "member"  
+                } else {
+                    "members"
+                };
+                let msg = info_menu(&format!("Poll won, but only {vote_count} {members} voted, expected at least {min_count} votes"))
+                    .message()
+                    .reference_message(&poll_message);
+                let _ = channel.send_message(shared, msg).await;
             }
             _ => {}
         }
+    }
+}
+
+async fn reboot_server(shared: &Shared, server: impl Into<String> + Clone) {
+    let null_history = MenuHistory::new("null");
+    // REBOOT THE SERVER
+    let msg = match send_command(shared, NetCommand::ServerCommand(server.clone().into(), ServerCommand::Status)) {
+        Ok(Response::Status(status)) => {
+            if status.status != Status::Idle {
+                let _ = send_command(shared, NetCommand::ServerCommand(server.into(), ServerCommand::Reboot));
+            }
+            None
+        }
+        Ok(any) => Some(send_unknown(&null_history, &any).await.message()),
+        Err(any) => Some(send_err(&null_history, &any).await.message()),
+    };
+
+    // Notify of errors happened trying to reboot
+    if let Some(msg) = msg {
+        let channel = shared.conf.with_config(|conf| conf.guild_data[&shared.guild].notifications);
+        let _ = channel.send_message(shared, msg).await;
     }
 }
 
@@ -2006,9 +2068,7 @@ fn mod_embed(info: &ModInfo) -> CreateEmbed {
     let mut menu_fields = Vec::new();
     menu_fields.push(("Mod ID".to_owned(), info.mod_id.clone(), true));
 
-    if let Some(version) = &info.version {
-        menu_fields.push(("Version".to_owned(), version.clone(), true));
-    }
+    menu_fields.push(("Version".to_owned(), info.version.to_string(), true));
 
     let mut menu = Menu::new(
         (106, 72, 161),

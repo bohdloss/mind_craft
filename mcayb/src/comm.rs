@@ -1,30 +1,20 @@
 use std::net::TcpStream;
 
 use anyhow::{bail, Result};
-use ende::io::Std;
 use ende::{BinSettings, BitWidth, Context, Encoder, NumEncoding, SizeRepr, VariantRepr};
+use ende::io::Std;
 use openssl::rsa::{Padding, Rsa};
 use serenity::all::GuildId;
-use yapper::{hash_pw, send_packet, LoginPacket, LoginResponse, NetCommand, Response};
+
+use yapper::{LoginPacket, LoginResponse, NetCommand, Response, send_packet};
+use yapper::conf::Config;
+
+use crate::bot::SharedMin;
+use crate::conf::MCAYB;
 
 const IP: &str = "127.0.0.1:23786";
 
 const PUB_KEY: &[u8] = include_bytes!("../sv_manage.pem");
-
-macro_rules! send_cmd {
-    ($cmd:expr => $resp:pat => $ret:expr) => {{
-        match $crate::comm::send_command($cmd) {
-            Ok($resp) => core::result::Result::Ok($ret),
-            any => core::result::Result::Err(anyhow::anyhow!(
-                "Expected {}, got {any:?}",
-                stringify!($resp)
-            )),
-        }
-    }};
-}
-pub(crate) use send_cmd;
-use yapper::conf::Config;
-use crate::conf::MCAYB;
 
 fn login(conf: &Config<MCAYB>, guild_id: GuildId) -> (String, [u8; 32]) {
     conf.with_config(|conf| {
@@ -33,9 +23,9 @@ fn login(conf: &Config<MCAYB>, guild_id: GuildId) -> (String, [u8; 32]) {
     })
 }
 
-pub fn send_command(conf: &Config<MCAYB>, guild: GuildId, cmd: NetCommand) -> Result<Response> {
+pub fn send_command(shared: &SharedMin, cmd: NetCommand) -> Result<Response> {
     let client = TcpStream::connect(IP)?;
-    let mut ctxt = Context::new()
+    let ctxt = Context::new()
         .settings(BinSettings::new()
             .variant_repr(VariantRepr::new()
                 .bit_width(BitWidth::Bit8))
@@ -57,7 +47,7 @@ pub fn send_command(conf: &Config<MCAYB>, guild: GuildId, cmd: NetCommand) -> Re
     let mut client = encoder.finish().0.into_inner();
 
     // Begin packet exchange
-    let (acc, pw) = login(conf, guild);
+    let (acc, pw) = login(&shared.conf, shared.guild);
     let login = LoginPacket {
         user: acc,
         password: pw,

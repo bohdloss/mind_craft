@@ -180,6 +180,13 @@ pub fn client_loop(client: TcpStream, ctx: Arc<Ctxt>) -> Result<()> {
 								.map_err(|err| (err, Response::Err))?;
 							Ok(x)
 						}
+						ServerCommand::ResolveDeps(mode, new_mods) => {
+							use anyhow::Context;
+							let x = server.send(Command::ResolveDeps(*mode, new_mods.clone()), Duration::from_secs(5))
+								.context("Failed to send command")
+								.map_err(|err| (err, Response::Err))?;
+							Ok(x)
+						}
 					}
 				} else {
 					Err((

@@ -1,16 +1,9 @@
 #![feature(try_blocks)]
 #![feature(let_chains)]
 
-use std::thread::spawn;
-use std::time::Duration;
-use std::{io::stdin, sync::Arc};
+use anyhow::Result;
 
-use crate::comm::send_cmd;
-use anyhow::{anyhow, Result};
-use tokio::sync::RwLock;
-use tokio::time::sleep;
 use yapper::conf::Config;
-use yapper::{NetCommand, Response, ServerCommand, Status};
 
 mod bot;
 mod comm;
@@ -69,7 +62,7 @@ async fn main() -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let lock = conf::acquire_lock()?;
+    let _lock = conf::acquire_lock()?;
     let config = Config::init(conf::CONFIG)?;
 
     bot::init(config).await?;

@@ -1,60 +1,50 @@
-use crate::bot::{DownloadedMod, FuckedUpMod, IdleMod, ModInstalling, MODS, ProcessedMod};
-use anyhow::{anyhow, bail, Context, Result};
-use image::DynamicImage;
+use std::io::ErrorKind;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
 use rand::{Rng, SeedableRng};
-use serde::{Deserialize, Serialize};
 use serenity::futures::{io, TryStreamExt};
-use std::io::{Cursor, ErrorKind, Read};
-use std::mem;
-use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
-use serenity::all::GuildId;
 use tokio::fs::File;
-use tokio::io::AsyncReadExt;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::io::StreamReader;
+
 use yapper::{DelOnDrop, dispatch_debug, parse_mod};
 
-pub async fn mod_thread(guild: GuildId, slot: usize) {
-    let (server, att_name) = {
-        let ModInstalling::Idle(IdleMod {
-            server, att_name, ..
-        }) = &MODS.lock().unwrap()[&guild][slot]
-        else {
-            panic!()
-        };
-        (server.clone(), att_name.clone())
-    };
-    match mod_thread_inner(guild, slot).await {
+use crate::bot::{DownloadedMod, FuckedUpMod, IdleMod, ModInstalling, ProcessedMod, Shared};
+
+pub async fn mod_thread(shared: Arc<Shared>, data: IdleMod) {
+    let slot = shared.mods_allocate(ModInstalling::Idle(data.clone())).await;
+    let server = data.server.clone();
+    let att_name = data.att_name.clone();
+    
+    match mod_thread_inner(&shared, slot, data).await {
         Ok(_) => {}
         Err(err) => {
             dispatch_debug(&err);
-            let _ = MODS.lock().unwrap().get_mut(&guild).unwrap().replace(
+            shared.mods_set(
                 slot,
                 ModInstalling::FuckedUp(FuckedUpMod {
                     server,
                     att_name,
                     err: err.to_string(),
                 }),
-            );
+            ).await;
         }
     }
 }
 
-async fn mod_thread_inner(guild: GuildId, slot: usize) -> Result<()> {
-    let ModInstalling::Idle(IdleMod {
+async fn mod_thread_inner(shared: &Shared, slot: usize, data: IdleMod) -> Result<()> {
+    let IdleMod {
         server,
         att_name,
         url,
-    }) = MODS.lock().unwrap()[&guild][slot].clone()
-    else {
-        return Err(anyhow!("Invalid mod state"));
-    };
+    } = data;
 
     let response = reqwest::get(url).await.context("URL get request failed")?;
     let stream = response
         .bytes_stream()
-        .map_err(|err| std::io::Error::new(ErrorKind::BrokenPipe, "Unknown"));
+        .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "Unknown"));
     let reader = StreamReader::new(stream);
 
     let (file, path) = loop {
@@ -79,7 +69,7 @@ async fn mod_thread_inner(guild: GuildId, slot: usize) -> Result<()> {
         file: path.clone(),
     });
 
-    MODS.lock().unwrap().get_mut(&guild).unwrap()[slot] = new_state;
+    shared.mods_set(slot, new_state).await;
 
     let mut info = parse_mod(&path)?;
     del.forgive();
@@ -90,7 +80,7 @@ async fn mod_thread_inner(guild: GuildId, slot: usize) -> Result<()> {
         info,
     });
 
-    MODS.lock().unwrap().get_mut(&guild).unwrap()[slot] = new_state;
+    shared.mods_set(slot, new_state).await;
 
     Ok(())
 }

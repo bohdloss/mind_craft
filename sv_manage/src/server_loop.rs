@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{Bound, HashMap};
 use std::fs::{File, FileType};
 use std::{fs, io, process, thread};
+use std::ffi::OsStr;
 use std::fmt::Debug;
 use std::io::{ErrorKind, Read, Write};
 use std::mem::replace;
@@ -22,16 +23,17 @@ use ende::{Decode, Encode, IntoRead};
 use expanduser::expanduser;
 use fs_extra::dir::{CopyOptions, TransitProcessResult};
 use mc_rcon::RconClient;
+use mvn_version::ComparableVersion;
 use once_cell::sync::Lazy;
 use parse_display::Display;
 use reqwest::blocking::Client;
 use reqwest::blocking::multipart::Form;
 use reqwest::header::AUTHORIZATION;
 use reqwest::StatusCode;
-use zip::{CompressionMethod, ZipWriter};
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 use zip::write::SimpleFileOptions;
 use uuid::Uuid;
-use yapper::{base64_encode, DelOnDrop, dispatch_debug, ModInfo, Notification, parse_mod, Response, Status, ZipProgress};
+use yapper::{base64_encode, DelOnDrop, DepResolveMode, DepState, dispatch_debug, ModInfo, Notification, parse_mod, parse_mod_ext, reserved_mod_id, Response, Status, ZipProgress};
 use yapper::conf::Config;
 use crate::config::{ServerConf, SVManage};
 use crate::sv_fs;
@@ -55,6 +57,8 @@ pub enum Command {
 	#[display("QueryMod({0:?})")]
 	QueryMod(String),
 	GenerateModsZip,
+	#[display("ResolveDeps({0:?})")]
+	ResolveDeps(DepResolveMode, Vec<ModInfo>)
 }
 
 struct ProcessComm {
@@ -112,10 +116,17 @@ struct Shared {
 	should_run: AtomicBool,
 	reboot_queued: AtomicBool,
 	status: Atomic<Status>,
-	mods_up_to_date: AtomicBool,
+	zip_up_to_date: AtomicBool,
+	mod_cache_up_to_date: AtomicBool,
+	mods_cache: Mutex<Option<Vec<ModInfo>>>,
 }
 
 impl Shared {
+	pub fn invalidate_mod_cache(&self) {
+		self.zip_up_to_date.store(false, Ordering::Relaxed);
+		self.mod_cache_up_to_date.store(false, Ordering::Release);
+	}
+	
 	pub fn update_status(&self, status: Status) {
 		let old = self.status.swap(status, Ordering::AcqRel);
 		if old != status {
@@ -168,7 +179,9 @@ impl Server {
 			should_run: AtomicBool::new(should_run),
 			reboot_queued: AtomicBool::new(false),
 			status: Atomic::new(Status::Idle),
-			mods_up_to_date: AtomicBool::new(false),
+			zip_up_to_date: AtomicBool::new(false),
+			mod_cache_up_to_date: AtomicBool::new(false),
+			mods_cache: Mutex::new(None),
 		});
 		let shared2 = shared.clone();
 
@@ -348,7 +361,7 @@ fn server_main(account: String, server: String, comm: ProcessComm, shared: Arc<S
 				}
 				Command::GenerateModsZip => {
 					let result: Result<String> = try {
-						if !shared.mods_up_to_date.load(Ordering::Acquire) {
+						if !shared.zip_up_to_date.load(Ordering::Acquire) {
 							shared.update_status(Status::Packaging);
 							let mods_folder = get_mods_path().context("Error getting mods folder path")?;
 							gen_mods_zip(&mods_folder, &account, &server, &shared, &mut |progress| {
@@ -398,7 +411,13 @@ fn ensure_dir(path: &Path) -> Result<()> {
 	}
 }
 
-fn list_mods(path: &Path) -> Result<Vec<ModInfo>> {
+fn list_mods(path: &Path, shared: &Shared) -> Result<Vec<ModInfo>> {
+	if shared.mod_cache_up_to_date.load(Ordering::Acquire) &&
+		let mut mods = shared.mods_cache.lock().unwrap() &&
+		let Some(mods) = &*mods {
+		return Ok(mods.clone());
+	}
+	
 	let mut vec = Vec::new();
 	for entry in path.read_dir().context("Failed to list mods directory")? {
 		let entry = entry.context("Failed to get directory listing item")?;
@@ -412,24 +431,102 @@ fn list_mods(path: &Path) -> Result<Vec<ModInfo>> {
 		}
 
 		// Parse mod
-		let info = match parse_mod(&path).context(format!("while parsing {path:?}")) {
+		let info = match parse_mod(&path).context(format!("Error while parsing {path:?}")) {
 			Ok(info) => info,
-			Err(err) => {
-				dispatch_debug(err);
-				continue
-			}
+			Err(_) => continue,
 		};
 		vec.push(info);
 	}
+
+	// Add forge as a mod
+	let server_path = expanduser(shared.conf.with_config(|conf| {
+		conf.accounts[&shared.account].servers[&shared.server].path.clone()
+	}))?;
+	let runner = server_path.join("run.sh");
+	let runner = fs::read_to_string(&runner).context(format!("Failed to read run script: {runner:?}"))?;
+
+	const START: &str = "@libraries";
+	const END: &str = "_args.txt";
+
+	let mc_version;
+	let forge_path;
+	if let Some(start) = runner.find(START) &&
+		let Some(end) = runner.rfind(END) {
+		let forge_dir = PathBuf::from(&runner[start + 1..end + END.len()]);
+		let mut forge_dir = server_path.join(forge_dir);
+		forge_dir.pop();
+
+		let mut forge_path_ = None;
+		for item in fs::read_dir(&forge_dir).context(format!("Failed to read a directory in /libraries: {path:?}"))? {
+			let Ok(item) = item else { continue };
+			let Ok(ftype) = item.file_type() else { continue };
+			if !ftype.is_file() { continue };
+			let path = item.path();
+			let Some(path_str) = path.to_str() else { continue };
+			if !path_str.ends_with("universal.jar") { continue };
+
+			forge_path_ = Some(path);
+			break;
+		}
+		forge_path = forge_path_.ok_or(anyhow!("Couldn't find forge jar file"))?;
+
+		let (mc_version_, forge_version) = forge_dir
+			.components()
+			.last()
+			.ok_or(anyhow!("Failed to get path component"))?
+			.as_os_str()
+			.to_str()
+			.ok_or(anyhow!("Path name is not utf-8"))?
+			.split_once("-")
+			.ok_or(anyhow!("Failed to parse minecraft and forge versions"))?;
+
+		let info = parse_mod_ext(&forge_path, Some(forge_version.to_owned())).context(format!(r#"Couldn't parse forge "{path:?}". WHAT!"#))?;
+		vec.push(info);
+
+		mc_version = mc_version_.to_owned();
+	} else {
+		bail!("Could't parse run.sh script");
+	}
+
+	// I tried to find a way to parse the mod info for the `minecraft` modid for basically 2 days.
+	// I have no idea where it is.
+	// It seems to only exist in the minecraft client itself.
+	// Anyways
+
+	let mut forge_zip = ZipArchive::new(
+		File::open(&forge_path).context("Failed to open forge jar file")?
+	).context("Failed to open forge jar file")?;
+	let mut mcp_logo = forge_zip.by_name("mcplogo.png").context("Failed to read mcplogo")?;
+	let mut data = Vec::new();
+	mcp_logo.read_to_end(&mut data)?;
+
+	let info = ModInfo {
+		filename: "minecraft".to_owned(),
+		path: forge_path.clone(),
+		mod_id: "minecraft".to_owned(),
+		name: Some("Minecraft".to_owned()),
+		description: None,
+		version: ComparableVersion::new(&mc_version),
+		logo: Some(data),
+		url: None,
+		credits: None,
+		authors: None,
+		dependencies: Vec::new(),
+	};
+	vec.push(info);
+
 	vec.sort_by(|mod1, mod2| mod1.mod_id.cmp(&mod2.mod_id));
+	
+	*shared.mods_cache.lock().unwrap() = Some(vec.clone());
+	shared.mod_cache_up_to_date.store(true, Ordering::Release);
 	Ok(vec)
 }
 
-fn query_mod(path: &Path, mod_id: &str) -> Result<ModInfo> {
-	list_mods(path)?.into_iter().find(|x| &x.mod_id == mod_id).ok_or(anyhow!("Couldn't find {mod_id}"))
+fn query_mod(path: &Path, mod_id: &str, shared: &Shared) -> Result<ModInfo> {
+	list_mods(path, shared)?.into_iter().find(|x| &x.mod_id == mod_id).ok_or(anyhow!("Couldn't find {mod_id}"))
 }
 
-#[derive(Encode, Decode)]
+#[derive(Encode, Decode, Hash, Eq, PartialEq)]
 struct Name {
 	account: String,
 	server: String
@@ -464,7 +561,7 @@ where F: FnMut(Progress)
 	// Create the file
 	let zip_path = PathBuf::from(format!("./{}.zip", name.to_base64()));
 
-	if shared.mods_up_to_date.load(Ordering::Acquire) {
+	if shared.zip_up_to_date.load(Ordering::Acquire) {
 		return Ok(zip_path);
 	}
 	let total = fs_extra::dir::get_size(mods_folder).context("Failed to get total mod folder size")?;
@@ -513,7 +610,7 @@ where F: FnMut(Progress)
 	}
 	zip.finish().context("Failed to finalize zip file")?;
 
-	shared.mods_up_to_date.store(true, Ordering::Release);
+	shared.zip_up_to_date.store(true, Ordering::Release);
 	Ok(zip_path)
 }
 
@@ -542,11 +639,11 @@ fn upload_zip(account: &str, server: &str) -> Result<String>
 	}
 }
 
-fn list_mods_paged<F>(per_page: u64, page: u64, mods: &F) -> Result<Response>
+fn list_mods_paged<F>(per_page: u64, page: u64, mods: &F, shared: &Shared) -> Result<Response>
 where F: Fn() -> Result<PathBuf>
 {
 	let mods_folder = mods()?;
-	let mods = list_mods(&mods_folder)?;
+	let mods = list_mods(&mods_folder, shared)?;
 
 	if per_page == 0 {
 		Ok(Response::Mods(mods, true))
@@ -587,7 +684,10 @@ where F: Fn() -> Result<PathBuf>
 		ensure_dir(&mods_folder).context("Error creating mods folder")?;
 
 		let to_install = parse_mod(&mod_path)?;
-		let all = list_mods(&mods_folder)?;
+		if reserved_mod_id(&to_install.mod_id) {
+			bail!("Reserved mod id!")
+		}
+		let all = list_mods(&mods_folder, shared)?;
 
 		if all.iter().any(|modd| modd.mod_id == to_install.mod_id) {
 			Response::ModConflict
@@ -604,7 +704,7 @@ where F: Fn() -> Result<PathBuf>
 			fs::rename(&mod_path, &destination_path).context("Failed to move mod")?;
 			del.forgive();
 
-			shared.mods_up_to_date.store(false, Ordering::Release);
+			shared.invalidate_mod_cache();
 			Response::Ok
 		}
 	};
@@ -629,7 +729,10 @@ where F: Fn() -> Result<PathBuf>
 		ensure_dir(&mods_folder).context("Error creating mods folder")?;
 
 		let to_install = parse_mod(&mod_path)?;
-		let all = list_mods(&mods_folder)?;
+		if reserved_mod_id(&to_install.mod_id) {
+			bail!("Reserved mod id!")
+		}
+		let all = list_mods(&mods_folder, shared)?;
 
 		if let Some(modd) = all.iter().find(|modd| modd.mod_id == to_install.mod_id) {
 			shared.update_status(Status::Modding);
@@ -645,7 +748,7 @@ where F: Fn() -> Result<PathBuf>
 			fs::rename(&mod_path, &destination_path).context("Failed to move mod")?;
 			del.forgive();
 
-			shared.mods_up_to_date.store(false, Ordering::Release);
+			shared.invalidate_mod_cache();
 			Response::Ok
 		} else {
 			Response::NoSuchMod
@@ -655,21 +758,142 @@ where F: Fn() -> Result<PathBuf>
 	r
 }
 
+fn resolve_deps<F>(mods: &F, shared: &Shared, mut the_mods: Vec<ModInfo>, mode: DepResolveMode) -> Result<Response>
+where F: Fn() -> Result<PathBuf>
+{
+	let mut unsat = Vec::new();
+	let mods_folder = mods()?;
+	ensure_dir(&mods_folder).context("Error creating mods folder")?;
+	let mut all = list_mods(&mods_folder, shared)?;
+
+	the_mods.sort_by(|first, second| first.mod_id.cmp(&second.mod_id));
+	let len = the_mods.len();
+	the_mods.dedup();
+	if the_mods.len() != len /* there were duplicates */ {
+		return Ok(Response::DepUnsatisfied(vec![("".to_owned(), DepState::InvalidInput)]))
+	}
+	
+	if the_mods.iter().any(|modd| reserved_mod_id(&modd.mod_id)) /* input contained reserved mod ids */ {
+		return Ok(Response::DepUnsatisfied(vec![("".to_owned(), DepState::InvalidInput)]))
+	}
+
+	match mode {
+		DepResolveMode::Installation => {
+			for the_mod in the_mods.iter() {
+				if let Some(other) = all.iter().find(|other| other.mod_id == the_mod.mod_id) {
+					unsat.push((other.mod_id.clone(), DepState::AlreadyInstalled));
+				}
+			}
+		}
+		DepResolveMode::Removal => {
+			for the_mod in the_mods.iter() {
+				if !all.iter().any(|other| other.mod_id == the_mod.mod_id) {
+					// AlreadyInstalled here actually means "Already not installed"
+					unsat.push((the_mod.mod_id.clone(), DepState::AlreadyInstalled));
+				}
+			}
+		}
+		DepResolveMode::Update => {
+			for the_mod in the_mods.iter() {
+				if let Some(installed_mod) = all.iter().find(|other| other.mod_id == the_mod.mod_id) {
+					if the_mod.version <= installed_mod.version {
+						// You tried to update a mod to an equal or lower version
+						// AlreadyInstalled here means "A newer or equal version is already installed"
+						unsat.push((the_mod.mod_id.clone(), DepState::AlreadyInstalled));
+					}
+				} else {
+					// You tried to update a mod that is not installed
+					unsat.push((the_mod.mod_id.clone(), DepState::NotInstalled));
+				}
+			}
+		}
+	}
+	
+	// Early return for errors at this point
+	if !unsat.is_empty() {
+		return Ok(Response::DepUnsatisfied(unsat));
+	};
+	
+	// Create hypothetical scenario where the changes have been made
+	// then try to resolve all dependencies
+	match mode {
+		DepResolveMode::Installation => all.append(&mut the_mods),
+		DepResolveMode::Removal => all.retain(|ours| !the_mods.iter().any(|other| other.mod_id == ours.mod_id)),
+		DepResolveMode::Update => {
+			for ours in all.iter_mut() {
+				if let Some(other) = the_mods.iter().find(|other| other.mod_id == ours.mod_id) {
+					*ours = other.clone();
+				}
+			}
+		}
+	}
+	
+	drop(the_mods);
+	let hypothetical = all;
+	
+	for the_mod in hypothetical.iter() {
+		// Try to resolve dependencies, pretending the changes have been made
+		for the_dep in the_mod.dependencies.iter() {
+			let find = hypothetical
+				.iter()
+				.find(|other| other.mod_id == the_dep.mod_id);
+
+			if let Some(found_dep) = find {
+				// Dependency is installed, but does the version match?
+				let version = &found_dep.version;
+
+				// Check low bound
+				let low_sat = match &the_dep.min_version {
+					Bound::Included(v) => version >= v,
+					Bound::Excluded(v) => version > v,
+					Bound::Unbounded => true,
+				};
+
+				// Check high bound
+				let high_sat = match &the_dep.max_version {
+					Bound::Included(v) => version <= v,
+					Bound::Excluded(v) => version < v,
+					Bound::Unbounded => true,
+				};
+
+				if low_sat && high_sat {
+					// Yay!
+				} else {
+					// :3c
+					unsat.push((the_dep.mod_id.clone(), DepState::VersionMismatch(version.clone())))
+				}
+			} else {
+				// Dependency is not installed, error
+				unsat.push((the_dep.mod_id.clone(), DepState::NotInstalled))
+			}
+		}
+	}
+	
+	if unsat.is_empty() {
+		Ok(Response::DepSatisfied)
+	} else {
+		Ok(Response::DepUnsatisfied(unsat))
+	}
+}
+
 fn uninstall_mod<F>(mod_id: String, mods: &F, shared: &Shared) -> Result<Response>
 where F: Fn() -> Result<PathBuf>
 {
 	let r: Result<Response> = try {
-
 		let mods_folder = mods()?;
 		ensure_dir(&mods_folder).context("Error creating mods folder")?;
 
-		let all = list_mods(&mods_folder)?;
+		let all = list_mods(&mods_folder, shared)?;
 
 		if let Some(modd) = all.iter().find(|modd| modd.mod_id == mod_id) {
+			if reserved_mod_id(&modd.mod_id) {
+				bail!("Reserved mod id!")
+			}
+
 			shared.update_status(Status::Modding);
 			fs::remove_file(&modd.path).context("Error deleting mod file")?;
 
-			shared.mods_up_to_date.store(false, Ordering::Release);
+			shared.invalidate_mod_cache();
 			Response::Ok
 		} else {
 			Response::NoSuchMod
@@ -699,11 +923,11 @@ where F: Fn() -> Result<PathBuf>,
 			}
 		},
 		Command::ListMods(per_page, page) => {
-			list_mods_paged(per_page, page, mods)
+			list_mods_paged(per_page, page, mods, shared)
 		}
 		Command::QueryMod(mod_id) => {
 			let mods_folder = mods()?;
-			Ok(Response::Mod(query_mod(&mods_folder, &mod_id)?))
+			Ok(Response::Mod(query_mod(&mods_folder, &mod_id, shared)?))
 		}
 		Command::InstallMod(mod_path, filename) => {
 			install_mod(mod_path, filename, mods, shared)
@@ -717,6 +941,9 @@ where F: Fn() -> Result<PathBuf>,
 		Command::GenerateModsZip => {
 			*deferred = Command::GenerateModsZip;
 			Ok(Response::Ok)
+		}
+		Command::ResolveDeps(mode, new_mods) => {
+			resolve_deps(mods, shared, new_mods, mode)
 		}
 		_ => Ok(Response::InvalidState),
 	}
@@ -878,11 +1105,11 @@ where F: Fn() -> Result<PathBuf>,
 			
 		},
 		Command::ListMods(per_page, page) => {
-			list_mods_paged(per_page, page, mods)
+			list_mods_paged(per_page, page, mods, shared)
 		}
 		Command::QueryMod(mod_id) => {
 			let mods_folder = mods()?;
-			Ok(Response::Mod(query_mod(&mods_folder, &mod_id)?))
+			Ok(Response::Mod(query_mod(&mods_folder, &mod_id, shared)?))
 		}
 		Command::InstallMod(mod_path, filename) => {
 			install_mod(mod_path, filename, mods, shared)
@@ -894,8 +1121,11 @@ where F: Fn() -> Result<PathBuf>,
 			uninstall_mod(mod_id, mods, shared)
 		}
 		Command::GenerateModsZip => {
-			shared.update_status(Status::Packaging);
-			Ok(Response::Ok)
+			// shared.update_status(Status::Packaging);
+			Ok(Response::Err)
+		}
+		Command::ResolveDeps(mode, new_mods) => {
+			resolve_deps(mods, shared, new_mods, mode)
 		}
 		_ => Ok(Response::InvalidState),
 	}

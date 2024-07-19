@@ -1,6 +1,10 @@
 #![feature(try_blocks)]
+#![feature(let_chains)]
 
 pub mod conf;
+mod mod_parser;
+
+pub use mod_parser::*;
 
 use std::collections::HashMap;
 use std::fmt::Formatter;
@@ -14,6 +18,7 @@ use base64::engine::general_purpose;
 use bytemuck::NoUninit;
 use ende::{Context, Decode, Encode, Encoder};
 use ende::io::{SizeLimit, Std, VecStream};
+use mvn_version::ComparableVersion;
 use openssl::rand::rand_bytes;
 use openssl::symm;
 use openssl::symm::Cipher;
@@ -129,6 +134,7 @@ pub enum ServerCommand {
 	UninstallMod(String),
 	UpdateMod(String, String),
 	GenerateModsZip,
+	ResolveDeps(DepResolveMode, Vec<ModInfo>),
 }
 
 impl Packet for NetCommand {
@@ -272,220 +278,29 @@ pub enum Response {
 	Mods(Vec<ModInfo>, bool),
 	#[display("Mod({0:?})")]
 	Mod(ModInfo),
+	#[display("DepUnsatisfied({0:?})")]
+	DepUnsatisfied(Vec<(String, DepState)>),
+	#[display("DepSatisfied")]
+	DepSatisfied
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Encode, Decode)]
-pub struct ModInfo {
-	pub filename: String,
-	pub path: PathBuf,
-	pub mod_id: String,
-	pub name: Option<String>,
-	pub description: Option<String>,
-	pub version: Option<String>,
-	pub logo: Option<Vec<u8>>,
-	pub url: Option<String>,
-	pub credits: Option<String>,
-	pub authors: Option<Vec<String>>
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Display, Encode, Decode)]
+pub enum DepResolveMode {
+	Installation,
+	Removal,
+	Update
 }
 
-pub fn parse_mod(path: &Path) -> Result<ModInfo> {
-	use anyhow::Context;
-	let file = std::fs::File::open(path).context("Failed to reopen the newly downloaded mod")?;
-	let mut archive = zip::ZipArchive::new(file).context("Failed to parse zip file")?;
-
-	let mut mod_info = archive
-		.by_name("META-INF/mods.toml")
-		.context("Couldn't find mod metadata")?;
-	let mut mods_toml = String::new();
-	mod_info
-		.read_to_string(&mut mods_toml)
-		.context("Failed to read mod metadata")?;
-	drop(mod_info);
-
-	let mut data: Result<ModsToml> = toml::from_str(&mods_toml).context("Failed to parse mods.toml");
-	let mut data = match data {
-		Ok(data) => data,
-		_ => {
-			let data: ModsTomlButCreditList = toml::from_str(&mods_toml).context("Failed to parse mods.toml (again)")?;
-			let mut convert = Vec::new();
-			for x in data.mods {
-				let ModsButCreditsList {
-					mod_id,
-					version,
-					display_name,
-					logo_file,
-					description,
-					display_url,
-					credits,
-					authors,
-				} = x;
-
-				let credits = if let Some(credits) = credits {
-					let mut string = String::new();
-					let mut first = true;
-					for x in credits {
-						if first {
-							first = false;
-							string.push_str(&x);
-						} else {
-							string.push_str(&format!(", {x}"));
-						}
-					}
-					Some(string)
-				} else { None };
-				
-				convert.push(Mods {
-					mod_id,
-					version,
-					display_name,
-					logo_file,
-					description,
-					display_url,
-					credits,
-					authors,
-				})
-			}
-			ModsToml { mods: convert }
-		}
-	};
-
-	if data.mods.len() != 1 {
-		bail!(
-            "Expected to find metadata for 1 mod but found metadata for {}",
-            data.mods.len()
-        );
-	}
-
-	let mut mods = data.mods.remove(0);
-
-	let logo_data = if let Some(logo) = mods.logo_file {
-		let x: Result<Vec<u8>> = try {
-			let mut logo_file = archive
-				.by_name(&logo)
-				.context("Couldn't read logo file")?;
-			let mut logo_data = Vec::new();
-			
-			// 10 MB limit
-			// let mut logo_file = Std::new(SizeLimit::new(Std::new(logo_file), 0, 1024 * 1024 * 10));
-			
-			logo_file
-				.read_to_end(&mut logo_data)
-				.context(format!("Failed to read logo data: {logo}"))?;
-			logo_data
-		};
-		x.ok()
-	} else { None };
-	
-	// let img = image::io::Reader::new(Cursor::new(&logo_data)).decode().context("Failed to load logo image")?;
-	// let mut png = Vec::new();
-	// img.write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png).context("Failed to convert image to png")?;
-
-	let version = if let Some(version) = mods.version {
-		let x: Result<String> = try {
-			let mut the_version = version;
-			if the_version.trim() == "${file.jarVersion}" {
-				let mut manifest = archive
-					.by_name("META-INF/MANIFEST.MF")
-					.context("Couldn't open jar manifest")?;
-				let mut manifest_data = String::new();
-				manifest
-					.read_to_string(&mut manifest_data)
-					.context("Failed to read manifest data")?;
-				for line in manifest_data.split("\n") {
-					if line.starts_with("Implementation-Version: ") {
-						if let Some(version) = line.trim().split(" ").nth(1) {
-							the_version = version.to_owned();
-							break;
-						}
-					}
-				}
-			}
-			the_version
-		};
-		x.ok()
-	} else { None };
-	
-	let filename: Result<String> = try {
-		path
-			.file_name()
-			.ok_or(anyhow!("Couldn't get file name"))?
-			.to_str()
-			.ok_or(anyhow!("Couldn't convert to string"))?
-			.to_string()
-	};
-	let filename = filename.unwrap_or(format!("{}.jar", mods.mod_id));
-
-	let authors = mods.authors.map(|authors| {
-		authors
-			.split(",")
-			.map(|string| string.trim())
-			.map(|string| string.to_owned())
-			.collect()
-	});
-
-
-	Ok(ModInfo {
-		filename,
-		path: path.canonicalize().context("Couldn't canonicalize path")?,
-		mod_id: mods.mod_id,
-		name: mods.display_name,
-		description: mods.description,
-		version,
-		logo: logo_data,
-		url: mods.display_url,
-		credits: mods.credits,
-		authors
-	})
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ModsTomlButCreditList {
-	mods: Vec<ModsButCreditsList>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ModsToml {
-	mods: Vec<Mods>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ModsButCreditsList {
-	#[serde(rename = "modId")]
-	mod_id: String,
-	#[serde(rename = "version")]
-	version: Option<String>,
-	#[serde(rename = "displayName")]
-	display_name: Option<String>,
-	#[serde(rename = "logoFile")]
-	logo_file: Option<String>,
-	#[serde(rename = "description")]
-	description: Option<String>,
-	#[serde(rename = "displayURL")]
-	display_url: Option<String>,
-	#[serde(rename = "credits")]
-	credits: Option<Vec<String>>,
-	#[serde(rename = "authors")]
-	authors: Option<String>
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Mods {
-	#[serde(rename = "modId")]
-	mod_id: String,
-	#[serde(rename = "version")]
-	version: Option<String>,
-	#[serde(rename = "displayName")]
-	display_name: Option<String>,
-	#[serde(rename = "logoFile")]
-	logo_file: Option<String>,
-	#[serde(rename = "description")]
-	description: Option<String>,
-	#[serde(rename = "displayURL")]
-	display_url: Option<String>,
-	#[serde(rename = "credits")]
-	credits: Option<String>,
-	#[serde(rename = "authors")]
-	authors: Option<String>
+#[derive(Debug, Clone, Eq, PartialEq, Display, Encode, Decode)]
+pub enum DepState {
+	NotInstalled,
+	#[display("VersionMismatch: got {0}")]
+	VersionMismatch(
+		#[ende(into: WrappedComparableVersion)]
+		ComparableVersion
+	),
+	AlreadyInstalled,
+	InvalidInput,
 }
 
 #[repr(transparent)]
